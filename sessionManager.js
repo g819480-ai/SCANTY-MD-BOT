@@ -20,7 +20,6 @@ const sessions = new Map();
 const sessionStatus = new Map();
 const presenceTimers = new Map();
 const qrStates = new Map();
-
 const secret = process.env.SESSION_ENCRYPTION_KEY?.trim();
 
 if (!secret || secret.length < 64) {
@@ -222,6 +221,10 @@ function attachSocket(userId, state, captureQr = false) {
     printQRInTerminal: false,
     markOnlineOnConnect: false,
     browser: Browsers.macOS('Chrome')
+  });
+
+  sessions.set(userId, sock);
+  sessionStatus.set(userId, 'connecting');
 
   sessions.set(userId, sock);
   sessionStatus.set(userId, 'connecting');
