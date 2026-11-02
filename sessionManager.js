@@ -216,7 +216,7 @@ function startPresenceHeartbeat(userId, sock) {
 }
 
 async function attachSocket(userId, state, captureQr = false) {
-  const { version } = await fetchLatestBaileysVersion(); {
+  const { version } = await fetchLatestBaileysVersion();
   const sock = makeWASocket,version
     auth: state,
     logger: pino({ level: 'info' }),
