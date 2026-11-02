@@ -223,13 +223,17 @@ async function attachSocket(userId, state, captureQr = false) {
 
   console.log('Using WhatsApp Web version:', version);
 
+  // Silva-inspired socket configuration.
+  // SCANTY's own Neon authentication storage remains unchanged.
   const sock = makeWASocket({
+    logger: pino({ level: 'silent' }),
+    printQRInTerminal: false,
+    browser: Browsers.macOS('Safari'),
     auth: state,
     version,
-    logger: pino({ level: 'info' }),
-    printQRInTerminal: false,
     markOnlineOnConnect: false,
-    browser: Browsers.macOS('Chrome')
+    syncFullHistory: false,
+    generateHighQualityLinkPreview: false
   });
 
   sessions.set(userId, sock);
