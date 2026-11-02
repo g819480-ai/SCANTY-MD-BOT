@@ -5,11 +5,7 @@ import pg from 'pg';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 
-import {
-  initializeSessionStorage,
-  startUserSession
-} from './sessionManager.js';
-
+import { initializeSessionStorage, startUserSession, restoreUserSessions } from "./sessionManager.js";
 const { Pool } = pg;
 
 const PORT = process.env.PORT || 3000;
@@ -497,7 +493,7 @@ async function startServer() {
   await initializeDatabase();
 
   await initializeSessionStorage();
-
+  await restoreUserSessions();
   const server = http.createServer((req, res) => {
     handleRequest(req, res).catch(error => {
       console.error('Request error:', error.message);
