@@ -3,7 +3,7 @@ import makeWASocket, { initAuthCreds, BufferJSON, proto } from '@whiskeysockets/
 import pino from 'pino';
 import crypto from 'node:crypto';
 import pg from 'pg';
-
+import { handleIncomingMessage } from './messageHandler.js';
 const { Pool } = pg;
 const sessions = new Map();
 const sessionStatus = new Map();
@@ -125,7 +125,7 @@ function makeAuthState(userId, creds) {
   };
 }
 
-function attachSocket(userId, state) {
+function attachSocket(userId, sock) {
   const sock = makeWASocket({
     auth: state,
     logger: pino({ level: 'silent' }),
@@ -144,15 +144,16 @@ function attachSocket(userId, state) {
     }
   });
 
-  sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
-    if (connection === 'open') {
-      sessionStatus.set(userId, 'connected');
-      console.log(`WhatsApp connected for user ${userId}`);
+  
     }
 
-    if (connection === 'connecting') {
-      sessionStatus.set(userId, 'connecting');
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+
+    for (const message of messages) {
+      await handleIncomingMessage(sock, userId, message);
     }
+  });
 
     if (connection === 'close') {
       sessionStatus.set(userId, 'disconnected');
