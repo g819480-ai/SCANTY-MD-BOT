@@ -1,6 +1,7 @@
 import makeWASocket, {
   initAuthCreds,
-  BufferJSON
+  BufferJSON,
+  proto
 } from '@whiskeysockets/baileys';
 
 import pino from 'pino';
@@ -19,7 +20,9 @@ const pool = new Pool({
 const secret = process.env.SESSION_ENCRYPTION_KEY;
 
 if (!secret || secret.length < 64) {
-  throw new Error('SESSION_ENCRYPTION_KEY must be at least 64 characters.');
+  throw new Error(
+    'SESSION_ENCRYPTION_KEY must be at least 64 characters.'
+  );
 }
 
 const encryptionKey = crypto
@@ -29,7 +32,13 @@ const encryptionKey = crypto
 
 function encrypt(value) {
   const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', encryptionKey, iv);
+
+  const cipher = crypto.createCipheriv(
+    'aes-256-gcm',
+    encryptionKey,
+    iv
+  );
+
   const encrypted = Buffer.concat([
     cipher.update(value, 'utf8'),
     cipher.final()
@@ -44,16 +53,21 @@ function encrypt(value) {
 
 function decrypt(value) {
   const [ivText, tagText, dataText] = value.split('.');
+
   const decipher = crypto.createDecipheriv(
     'aes-256-gcm',
     encryptionKey,
     Buffer.from(ivText, 'base64')
   );
 
-  decipher.setAuthTag(Buffer.from(tagText, 'base64'));
+  decipher.setAuthTag(
+    Buffer.from(tagText, 'base64')
+  );
 
   return Buffer.concat([
-    decipher.update(Buffer.from(dataText, 'base64')),
+    decipher.update(
+      Buffer.from(dataText, 'base64')
+    ),
     decipher.final()
   ]).toString('utf8');
 }
@@ -61,13 +75,21 @@ function decrypt(value) {
 async function saveRecord(userId, type, id, value) {
   if (value === null || value === undefined) {
     await pool.query(
-      'DELETE FROM whatsapp_sessions WHERE user_id = $1 AND record_type = $2 AND record_id = $3',
+      `DELETE FROM whatsapp_sessions
+       WHERE user_id = $1
+       AND record_type = $2
+       AND record_id = $3`,
       [userId, type, id]
     );
+
     return;
   }
 
-  const serialized = JSON.stringify(value, BufferJSON.replacer);
+  const serialized = JSON.stringify(
+    value,
+    BufferJSON.replacer
+  );
+
   const encrypted = encrypt(serialized);
 
   await pool.query(
@@ -75,19 +97,26 @@ async function saveRecord(userId, type, id, value) {
       (user_id, record_type, record_id, encrypted_data)
      VALUES ($1, $2, $3, $4)
      ON CONFLICT (user_id, record_type, record_id)
-     DO UPDATE SET encrypted_data = EXCLUDED.encrypted_data`,
+     DO UPDATE SET
+       encrypted_data = EXCLUDED.encrypted_data,
+       updated_at = NOW()`,
     [userId, type, id, encrypted]
   );
 }
 
 async function readRecord(userId, type, id) {
   const result = await pool.query(
-    `SELECT encrypted_data FROM whatsapp_sessions
-     WHERE user_id = $1 AND record_type = $2 AND record_id = $3`,
+    `SELECT encrypted_data
+     FROM whatsapp_sessions
+     WHERE user_id = $1
+     AND record_type = $2
+     AND record_id = $3`,
     [userId, type, id]
   );
 
-  if (!result.rows[0]) return null;
+  if (!result.rows[0]) {
+    return null;
+  }
 
   return JSON.parse(
     decrypt(result.rows[0].encrypted_data),
@@ -98,7 +127,8 @@ async function readRecord(userId, type, id) {
 export async function initializeSessionStorage() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS whatsapp_sessions (
-      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL
+        REFERENCES users(id) ON DELETE CASCADE,
       record_type TEXT NOT NULL,
       record_id TEXT NOT NULL,
       encrypted_data TEXT NOT NULL,
@@ -108,40 +138,68 @@ export async function initializeSessionStorage() {
   `);
 }
 
-export async function startUserSession(userId, phoneNumber, onPairingCode) {
+export async function startUserSession(
+  userId,
+  phoneNumber,
+  onPairingCode
+) {
   if (!/^[a-f0-9-]{16,64}$/i.test(userId)) {
     throw new Error('Invalid user ID.');
   }
 
   if (!/^\d{10,15}$/.test(phoneNumber)) {
-    throw new Error('Enter your country code and phone number using digits only.');
+    throw new Error(
+      'Enter your country code and phone number using digits only.'
+    );
   }
 
   if (sessions.has(userId)) {
-    throw new Error('A WhatsApp session is already active for this user.');
+    throw new Error(
+      'A WhatsApp session is already active for this user.'
+    );
   }
 
-  const savedCreds = await readRecord(userId, 'creds', 'main');
+  const savedCreds = await readRecord(
+    userId,
+    'creds',
+    'main'
+  );
 
   if (savedCreds?.registered) {
-    throw new Error('This WhatsApp account is already linked. Disconnect it before pairing again.');
+    throw new Error(
+      'This WhatsApp account is already linked. Disconnect it before pairing again.'
+    );
   }
 
   const state = {
     creds: savedCreds || initAuthCreds(),
+
     keys: {
       get: async (type, ids) => {
         const result = {};
 
-        await Promise.all(ids.map(async id => {
-          let value = await readRecord(userId, type, id);
+        await Promise.all(
+          ids.map(async id => {
+            let value = await readRecord(
+              userId,
+              type,
+              id
+            );
 
-          if (type === 'app-state-sync-key' && value) {
-            value = (await import('@whiskeysockets/baileys')).proto.Message.AppStateSyncKeyData.fromObject(value);
-          }
+            if (
+              type === 'app-state-sync-key' &&
+              value
+            ) {
+              value = proto.Message
+                .AppStateSyncKeyData
+                .fromObject(value);
+            }
 
-          if (value) result[id] = value;
-        }));
+            if (value) {
+              result[id] = value;
+            }
+          })
+        );
 
         return result;
       },
@@ -149,8 +207,9 @@ export async function startUserSession(userId, phoneNumber, onPairingCode) {
       set: async data => {
         for (const [type, records] of Object.entries(data)) {
           await Promise.all(
-            Object.entries(records).map(([id, value]) =>
-              saveRecord(userId, type, id, value)
+            Object.entries(records).map(
+              ([id, value]) =>
+                saveRecord(userId, type, id, value)
             )
           );
         }
@@ -168,12 +227,26 @@ export async function startUserSession(userId, phoneNumber, onPairingCode) {
   sessions.set(userId, sock);
 
   sock.ev.on('creds.update', async () => {
-    await saveRecord(userId, 'creds', 'main', state.creds);
+    try {
+      await saveRecord(
+        userId,
+        'creds',
+        'main',
+        state.creds
+      );
+    } catch (error) {
+      console.error(
+        'Could not save WhatsApp credentials:',
+        error.message
+      );
+    }
   });
 
   sock.ev.on('connection.update', ({ connection }) => {
     if (connection === 'open') {
-      console.log(`WhatsApp connected for user ${userId}`);
+      console.log(
+        `WhatsApp connected for user ${userId}`
+      );
     }
 
     if (connection === 'close') {
@@ -182,9 +255,14 @@ export async function startUserSession(userId, phoneNumber, onPairingCode) {
   });
 
   try {
-    const code = await sock.requestPairingCode(phoneNumber);
+    const code = await sock.requestPairingCode(
+      phoneNumber
+    );
+
     onPairingCode(code);
+
     return { started: true };
+
   } catch (error) {
     sessions.delete(userId);
     sock.end(error);
