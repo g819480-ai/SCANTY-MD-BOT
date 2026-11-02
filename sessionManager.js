@@ -21,6 +21,7 @@ const sessions = new Map();
 const sessionStatus = new Map();
 const presenceTimers = new Map();
 const qrStates = new Map();
+
 const secret = process.env.SESSION_ENCRYPTION_KEY?.trim();
 
 if (!secret || secret.length < 64) {
@@ -216,17 +217,20 @@ function startPresenceHeartbeat(userId, sock) {
 }
 
 async function attachSocket(userId, state, captureQr = false) {
+  console.log('Fetching the latest WhatsApp Web version...');
+
   const { version } = await fetchLatestBaileysVersion();
-  const sock = makeWASocket,version
+
+  console.log('Using WhatsApp Web version:', version);
+
+  const sock = makeWASocket({
     auth: state,
+    version,
     logger: pino({ level: 'info' }),
     printQRInTerminal: false,
     markOnlineOnConnect: false,
     browser: Browsers.macOS('Chrome')
   });
-
-  sessions.set(userId, sock);
-  sessionStatus.set(userId, 'connecting');
 
   sessions.set(userId, sock);
   sessionStatus.set(userId, 'connecting');
@@ -287,9 +291,7 @@ async function attachSocket(userId, state, captureQr = false) {
           });
         }
 
-        console.log(
-          `WhatsApp connected for user ${userId}`
-        );
+        console.log(`WhatsApp connected for user ${userId}`);
 
         startPresenceHeartbeat(userId, sock);
       }
@@ -375,7 +377,7 @@ export async function restoreUserSessions() {
 
       if (!creds?.registered) continue;
 
-      attachSocket(
+      await attachSocket(
         userId,
         makeAuthState(userId, creds)
       );
@@ -449,7 +451,7 @@ export async function startUserQrSession(userId) {
     updatedAt: Date.now()
   });
 
-  attachSocket(userId, state, true);
+  await attachSocket(userId, state, true);
 
   return { started: true };
 }
@@ -490,7 +492,7 @@ export async function startUserSession(
   qrStates.delete(userId);
 
   const state = makeAuthState(userId, savedCreds);
-  const sock = attachSocket(userId, state);
+  const sock = await attachSocket(userId, state);
 
   try {
     await delay(1500);
@@ -500,7 +502,7 @@ export async function startUserSession(
       sessionStatus.get(userId) === 'disconnected'
     ) {
       throw new Error(
-        'WhatsApp socket closed before pairing. Check the Render logs for WHATSAPP DISCONNECT DETAILS.'
+        'WhatsApp socket closed before pairing. Check Render logs for WHATSAPP DISCONNECT DETAILS.'
       );
     }
 
