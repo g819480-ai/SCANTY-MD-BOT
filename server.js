@@ -5,14 +5,31 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 
 const { Pool } = pg;
-const PORT = process.env.PORT || 3000;
 
-if (!process.env.DATABASE_URL || !process.env.JWT_SECRET) {
-  throw new Error('DATABASE_URL and JWT_SECRET must be configured.');
+const PORT = process.env.PORT || 3000;
+const DATABASE_URL = process.env.DATABASE_URL;
+const JWT_SECRET = process.env.JWT_SECRET;
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL?.trim().toLowerCase();
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+const DASHBOARD_ORIGIN =
+  process.env.DASHBOARD_ORIGIN ||
+  'https://scanty-md-dashboard.g819480.workers.dev';
+
+if (!DATABASE_URL || !JWT_SECRET || JWT_SECRET.length < 32) {
+  throw new Error('DATABASE_URL and a JWT_SECRET of at least 32 characters are required.');
+}
+
+if (
+  !ADMIN_EMAIL ||
+  !ADMIN_PASSWORD ||
+  Buffer.byteLength(ADMIN_PASSWORD, 'utf8') > 72 ||
+  ADMIN_PASSWORD.length < 12
+) {
+  throw new Error('Set ADMIN_EMAIL and an ADMIN_PASSWORD of at least 12 characters (maximum 72 bytes).');
 }
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false },
   max: 5,
   connectionTimeoutMillis: 10000
@@ -21,8 +38,10 @@ const pool = new Pool({
 function send(res, status, data) {
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
-    'Cache-Control': 'no-store'
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff'
   });
+
   res.end(JSON.stringify(data));
 }
 
@@ -34,7 +53,7 @@ function readBody(req) {
       body += chunk;
 
       if (body.length > 10000) {
-        reject(new Error('Request too large'));
+        reject(new Error('Request body too large'));
         req.destroy();
       }
     });
@@ -53,91 +72,181 @@ function readBody(req) {
 
 function createToken(user) {
   return jwt.sign(
-    { userId: user.id, email: user.email },
-    process.env.JWT_SECRET,
+    { userId: user.id },
+    JWT_SECRET,
     { expiresIn: '1h' }
   );
 }
 
-async function startServer() {
-  await pool.query('SELECT 1');
-  console.log('Neon database connected.');
+function getToken(req) {
+  const header = req.headers.authorization || '';
 
-  const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url, `http://${req.headers.host || '    const allowedOrigin =
-      'https://scanty-md-dashboard.g819480.workers.dev';
+  if (!header.startsWith('Bearer ')) return null;
 
-    const origin = req.headers.origin;
+  return header.slice(7);
+}
 
-    if (origin === allowedOrigin) {
-      res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
-    }
+async function authenticatedUser(req) {
+  const token = getToken(req);
 
+  if (!token) return null;
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+
+    const result = await pool.query(
+      `SELECT id, email, role, created_at
+       FROM users
+       WHERE id = $1`,
+      [decoded.userId]
+    );
+
+    return result.rows[0] || null;
+  } catch {
+    return null;
+  }
+}
+
+async function initializeDatabase() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      email TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user'
+  `);
+
+  await pool.query(`
+    UPDATE users SET role = 'user'
+    WHERE role IS NULL OR role NOT IN ('user', 'admin')
+  `);
+
+  const passwordHash = await bcrypt.hash(ADMIN_PASSWORD, 12);
+
+  await pool.query(
+    `INSERT INTO users (email, password_hash, role)
+     VALUES ($1, $2, 'admin')
+     ON CONFLICT (email)
+     DO UPDATE SET
+       password_hash = EXCLUDED.password_hash,
+       role = 'admin'`,
+    [ADMIN_EMAIL, passwordHash]
+  );
+
+  console.log('Database initialized. Admin account is ready.');
+}
+
+const rateLimits = new Map();
+
+function rateLimit(req, res) {
+  const key = `${req.socket.remoteAddress}:${req.url}`;
+  const now = Date.now();
+  const previous = rateLimits.get(key);
+
+  if (!previous || now - previous.start > 60000) {
+    rateLimits.set(key, { start: now, count: 1 });
+    return false;
+  }
+
+  previous.count += 1;
+
+  if (previous.count > 20) {
+    send(res, 429, { error: 'Too many requests. Try again later.' });
+    return true;
+  }
+
+  return false;
+}
+
+async function handleRequest(req, res) {
+  const origin = req.headers.origin;
+
+  if (origin === DASHBOARD_ORIGIN) {
+    res.setHeader('Access-Control-Allow-Origin', DASHBOARD_ORIGIN);
     res.setHeader('Vary', 'Origin');
-    res.setHeader(
-      'Access-Control-Allow-Methods',
-      'GET, POST, OPTIONS'
-    );
-    res.setHeader(
-      'Access-Control-Allow-Headers',
-      'Content-Type, Authorization'
-    );
+  }
 
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204);
-      return res.end();
+  res.setHeader(
+    'Access-Control-Allow-Methods',
+    'GET, POST, OPTIONS'
+  );
+
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'Content-Type, Authorization'
+  );
+
+  if (req.method === 'OPTIONS') {
+    if (origin && origin !== DASHBOARD_ORIGIN) {
+      return send(res, 403, { error: 'Origin not allowed.' });
     }
-    if (req.method === 'GET' && url.pathname === '/') {
-      return send(res, 200, {
-        success: true,
-        name: 'SCANTY MD BOT',
-        status: 'running'
+
+    res.writeHead(204);
+    return res.end();
+  }
+
+  if (origin && origin !== DASHBOARD_ORIGIN) {
+    return send(res, 403, { error: 'Origin not allowed.' });
+  }
+
+  const url = new URL(
+    req.url,
+    `http://${req.headers.host || 'localhost'}`
+  );
+
+  if (
+    req.method === 'POST' &&
+    (url.pathname === '/api/auth/register' ||
+     url.pathname === '/api/auth/login')
+  ) {
+    if (rateLimit(req, res)) return;
+
+    let body;
+
+    try {
+      body = await readBody(req);
+    } catch {
+      return send(res, 400, { error: 'Invalid request body.' });
+    }
+
+    const email = String(body.email || '').trim().toLowerCase();
+    const password = body.password;
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return send(res, 400, { error: 'Enter a valid email address.' });
+    }
+
+    if (
+      typeof password !== 'string' ||
+      password.length < 8 ||
+      Buffer.byteLength(password, 'utf8') > 72
+    ) {
+      return send(res, 400, {
+        error: 'Password must be at least 8 characters and no more than 72 bytes.'
       });
     }
 
-    if (req.method === 'GET' && url.pathname === '/health') {
-      return send(res, 200, { status: 'online' });
-    }
-
-    if (req.method === 'GET' && url.pathname === '/db-health') {
-      try {
-        await pool.query('SELECT NOW()');
-        return send(res, 200, {
-          status: 'connected',
-          database: 'Neon PostgreSQL'
+    if (url.pathname === '/api/auth/register') {
+      if (email === ADMIN_EMAIL) {
+        return send(res, 403, {
+          error: 'This email is reserved for the administrator.'
         });
-      } catch {
-        return send(res, 503, { status: 'disconnected' });
       }
-    }
 
-    if (req.method === 'POST' && url.pathname === '/api/auth/register') {
       try {
-        const { email, password } = await readBody(req);
-
-        const cleanEmail = String(email || '').trim().toLowerCase();
-
-        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
-          return send(res, 400, { error: 'Enter a valid email address.' });
-        }
-
-        if (
-          typeof password !== 'string' ||
-          password.length < 8 ||
-          Buffer.byteLength(password, 'utf8') > 72
-        ) {
-          return send(res, 400, {
-            error: 'Password must be at least 8 characters and no more than 72 bytes.'
-          });
-        }
-
         const passwordHash = await bcrypt.hash(password, 12);
 
         const result = await pool.query(
-          `INSERT INTO users (email, password_hash)
-           VALUES ($1, $2)
-           RETURNING id, email, created_at`,
-          [cleanEmail, passwordHash]
+          `INSERT INTO users (email, password_hash, role)
+           VALUES ($1, $2, 'user')
+           RETURNING id, email, role, created_at`,
+          [email, passwordHash]
         );
 
         const user = result.rows[0];
@@ -150,72 +259,145 @@ async function startServer() {
         });
       } catch (error) {
         if (error.code === '23505') {
-          return send(res, 409, { error: 'This email is already registered.' });
+          return send(res, 409, {
+            error: 'This email is already registered.'
+          });
         }
 
         console.error('Registration error:', error.message);
-        return send(res, 400, { error: 'Registration could not be completed.' });
+        return send(res, 500, {
+          error: 'Registration could not be completed.'
+        });
       }
     }
 
-    if (req.method === 'POST' && url.pathname === '/api/auth/login') {
-      try {
-        const { email, password } = await readBody(req);
-        const cleanEmail = String(email || '').trim().toLowerCase();
+    try {
+      const result = await pool.query(
+        `SELECT id, email, password_hash, role, created_at
+         FROM users WHERE email = $1`,
+        [email]
+      );
 
-        if (typeof password !== 'string') {
-          return send(res, 400, { error: 'Email and password are required.' });
-        }
+      const user = result.rows[0];
 
-        const result = await pool.query(
-          'SELECT id, email, password_hash FROM users WHERE email = $1',
-          [cleanEmail]
-        );
+      if (!user || !(await bcrypt.compare(password, user.password_hash))) {
+        return send(res, 401, {
+          error: 'Incorrect email or password.'
+        });
+      }
 
-        const user = result.rows[0];
+      return send(res, 200, {
+        success: true,
+        message: 'Login successful.',
+        user: {
+          id: user.id,
+          email: user.email,
+          role: user.role
+        },
+        token: createToken(user)
+      });
+    } catch (error) {
+      console.error('Login error:', error.message);
+      return send(res, 500, { error: 'Login could not be completed.' });
+    }
+  }
 
-        if (!user || !(await bcrypt.compare(password, user.password_hash))) {
-          return send(res, 401, { error: 'Incorrect email or password.' });
-        }
+  if (req.method === 'GET' && url.pathname === '/') {
+    return send(res, 200, {
+      success: true,
+      name: 'SCANTY MD BOT',
+      status: 'running'
+    });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/health') {
+    return send(res, 200, { status: 'online' });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/db-health') {
+    try {
+      await pool.query('SELECT NOW()');
+
+      return send(res, 200, {
+        status: 'connected',
+        database: 'Neon PostgreSQL'
+      });
+    } catch (error) {
+      console.error('Database health error:', error.message);
+      return send(res, 503, { status: 'disconnected' });
+    }
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/auth/me') {
+    const user = await authenticatedUser(req);
+
+    if (!user) {
+      return send(res, 401, { error: 'Please log in again.' });
+    }
+
+    return send(res, 200, { success: true, user });
+  }
+
+  if (
+    req.method === 'GET' &&
+    (url.pathname === '/api/admin/stats' ||
+     url.pathname === '/api/admin/users')
+  ) {
+    const user = await authenticatedUser(req);
+
+    if (!user || user.role !== 'admin') {
+      return send(res, 403, { error: 'Administrator access required.' });
+    }
+
+    try {
+      if (url.pathname === '/api/admin/stats') {
+        const result = await pool.query(`
+          SELECT
+            COUNT(*)::int AS total_users,
+            COUNT(*) FILTER (WHERE role = 'admin')::int AS total_admins,
+            COUNT(*) FILTER (WHERE role = 'user')::int AS total_members
+          FROM users
+        `);
 
         return send(res, 200, {
           success: true,
-          message: 'Login successful.',
-          user: { id: user.id, email: user.email },
-          token: createToken(user)
+          stats: result.rows[0]
         });
-      } catch (error) {
-        console.error('Login error:', error.message);
-        return send(res, 400, { error: 'Login could not be completed.' });
       }
+
+      const result = await pool.query(`
+        SELECT id, email, role, created_at
+        FROM users
+        ORDER BY created_at DESC
+        LIMIT 100
+      `);
+
+      return send(res, 200, {
+        success: true,
+        users: result.rows
+      });
+    } catch (error) {
+      console.error('Admin request error:', error.message);
+      return send(res, 500, { error: 'Could not load admin data.' });
     }
+  }
 
-    if (req.method === 'GET' && url.pathname === '/api/auth/me') {
-      const header = req.headers.authorization || '';
-      const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  return send(res, 404, { error: 'Route not found.' });
+}
 
-      try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+async function startServer() {
+  await initializeDatabase();
 
-        const result = await pool.query(
-          'SELECT id, email, created_at FROM users WHERE id = $1',
-          [decoded.userId]
-        );
+  const server = http.createServer((req, res) => {
+    handleRequest(req, res).catch(error => {
+      console.error('Request error:', error.message);
 
-        if (!result.rows[0]) {
-          return send(res, 404, { error: 'Account not found.' });
-        }
-
-        return send(res, 200, {
-          success: true,
-          user: result.rows[0]
-        });
-      } catch {
-        return send(res, 401, { error: 'A valid login token is required.' });
+      if (!res.headersSent) {
+        send(res, 500, { error: 'Internal server error.' });
+      } else {
+        res.end();
       }
-    }
-
-    return send(res, 404, { error: 'Route not found.' });
+    });
   });
 
   server.listen(PORT, '0.0.0.0', () => {
