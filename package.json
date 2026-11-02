@@ -12,9 +12,11 @@
   "engines": {
     "node": ">=20"
   },
-  "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.24",
-    "dotenv": "^16.4.7",
-    "pino": "^9.6.0"
-  }
+"dependencies": {
+  "@whiskeysockets/baileys": "^6.7.24",
+  "dotenv": "^16.4.7",
+  "pino": "^9.6.0",
+  "pg": "^8.13.1",
+  "bcryptjs": "^2.4.3",
+  "jsonwebtoken": "^9.0.2"
 }
