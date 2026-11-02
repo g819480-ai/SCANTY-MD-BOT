@@ -5,9 +5,17 @@ import pg from 'pg';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 
-import { initializeSessionStorage, startUserSession, restoreUserSessions } from "./sessionManager.js";
-const { Pool } = pg;
+import {
+  initializeSessionStorage,
+  startUserSession,
+  startUserQrSession,
+  getUserQrState,
+  restoreUserSessions
+} from './sessionManager.js';
+
 import { initializeFeatureSettings } from './featureSettings.js';
+
+const { Pool } = pg;
 
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -367,6 +375,61 @@ async function handleRequest(req, res) {
     });
   }
 
+  // Start QR pairing
+
+  if (
+    req.method === 'POST' &&
+    url.pathname === '/api/whatsapp/qr'
+  ) {
+    if (rateLimit(req, res, 5)) return;
+
+    const user = await authenticatedUser(req);
+
+    if (!user) {
+      return send(res, 401, {
+        error: 'Please log in before connecting WhatsApp.'
+      });
+    }
+
+    try {
+      await startUserQrSession(user.id);
+
+      return send(res, 202, {
+        success: true,
+        message: 'QR pairing started. Waiting for WhatsApp QR code.',
+        ...getUserQrState(user.id)
+      });
+    } catch (error) {
+      console.error('WhatsApp QR start error:', error.message);
+
+      return send(res, 400, {
+        error: error.message || 'Could not start QR pairing.'
+      });
+    }
+  }
+
+  // Retrieve QR pairing state
+
+  if (
+    req.method === 'GET' &&
+    url.pathname === '/api/whatsapp/qr'
+  ) {
+    if (rateLimit(req, res, 60)) return;
+
+    const user = await authenticatedUser(req);
+
+    if (!user) {
+      return send(res, 401, {
+        error: 'Please log in before checking WhatsApp pairing.'
+      });
+    }
+
+    return send(res, 200, {
+      success: true,
+      ...getUserQrState(user.id)
+    });
+  }
+
   // WhatsApp pairing code
 
   if (
@@ -491,12 +554,11 @@ async function handleRequest(req, res) {
 }
 
 async function startServer() {
-
   await initializeDatabase();
-await initializeSessionStorage();
-await initializeFeatureSettings();
-await restoreUserSessions();
- 
+  await initializeSessionStorage();
+  await initializeFeatureSettings();
+  await restoreUserSessions();
+
   const server = http.createServer((req, res) => {
     handleRequest(req, res).catch(error => {
       console.error('Request error:', error.message);
