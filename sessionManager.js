@@ -3,7 +3,8 @@ import makeWASocket, {
   initAuthCreds,
   BufferJSON,
   proto,
-  Browsers
+  Browsers,
+  fetchLatestBaileysVersion
 } from '@whiskeysockets/baileys';
 
 import pino from 'pino';
@@ -214,8 +215,9 @@ function startPresenceHeartbeat(userId, sock) {
   presenceTimers.set(userId, timer);
 }
 
-function attachSocket(userId, state, captureQr = false) {
-  const sock = makeWASocket({
+async function attachSocket(userId, state, captureQr = false) {
+  const { version } = await fetchLatestBaileysVersion(); {
+  const sock = makeWASocket,version
     auth: state,
     logger: pino({ level: 'info' }),
     printQRInTerminal: false,
