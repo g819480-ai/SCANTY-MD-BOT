@@ -7,6 +7,7 @@ import jwt from 'jsonwebtoken';
 
 import { initializeSessionStorage, startUserSession, restoreUserSessions } from "./sessionManager.js";
 const { Pool } = pg;
+import { initializeFeatureSettings } from './featureSettings.js';
 
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -490,10 +491,12 @@ async function handleRequest(req, res) {
 }
 
 async function startServer() {
-  await initializeDatabase();
 
-  await initializeSessionStorage();
-  await restoreUserSessions();
+  await initializeDatabase();
+await initializeSessionStorage();
+await initializeFeatureSettings();
+await restoreUserSessions();
+ 
   const server = http.createServer((req, res) => {
     handleRequest(req, res).catch(error => {
       console.error('Request error:', error.message);
