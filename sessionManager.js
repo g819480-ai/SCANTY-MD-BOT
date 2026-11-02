@@ -1,3 +1,4 @@
+
 import makeWASocket, {
   initAuthCreds,
   BufferJSON,
@@ -24,6 +25,10 @@ if (!secret || secret.length < 64) {
   throw new Error(
     'SESSION_ENCRYPTION_KEY must exist and contain at least 64 characters.'
   );
+}
+
+if (!process.env.DATABASE_URL) {
+  throw new Error('DATABASE_URL is missing.');
 }
 
 const pool = new Pool({
@@ -64,6 +69,10 @@ function encrypt(value) {
 
 function decrypt(value) {
   const [ivText, tagText, dataText] = value.split('.');
+
+  if (!ivText || !tagText || !dataText) {
+    throw new Error('Invalid encrypted WhatsApp session record.');
+  }
 
   const decipher = crypto.createDecipheriv(
     'aes-256-gcm',
@@ -207,9 +216,13 @@ function startPresenceHeartbeat(userId, sock) {
 function attachSocket(userId, state) {
   const sock = makeWASocket({
     auth: state,
-    logger: pino({ level: 'silent' }),
+
+    // Enable logs so we can identify pairing failures.
+    logger: pino({ level: 'info' }),
+
     printQRInTerminal: false,
-    markOnlineOnConnect: false
+    markOnlineOnConnect: false,
+    browser: ['SCANTY MD BOT', 'Chrome', '120.0.0']
   });
 
   sessions.set(userId, sock);
@@ -226,7 +239,6 @@ function attachSocket(userId, state) {
     }
   });
 
-  // Incoming WhatsApp messages and status updates.
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
 
@@ -246,7 +258,6 @@ function attachSocket(userId, state) {
     }
   });
 
-  // WhatsApp connection status.
   sock.ev.on(
     'connection.update',
     async ({ connection, lastDisconnect }) => {
@@ -275,11 +286,12 @@ function attachSocket(userId, state) {
           sessions.delete(userId);
         }
 
-        console.log(
-          `WhatsApp disconnected for user ${userId}; status: ${
-            lastDisconnect?.error?.output?.statusCode ?? 'unknown'
-          }`
-        );
+        console.error('WHATSAPP DISCONNECT DETAILS:', {
+          userId,
+          statusCode: lastDisconnect?.error?.output?.statusCode,
+          message: lastDisconnect?.error?.message,
+          error: lastDisconnect?.error?.toString()
+        });
       }
     }
   );
@@ -386,14 +398,15 @@ export async function startUserSession(
   const sock = attachSocket(userId, state);
 
   try {
-    await delay(5000);
+    // Wait briefly for the socket to start.
+    await delay(1500);
 
     if (
       sessions.get(userId) !== sock ||
       sessionStatus.get(userId) === 'disconnected'
     ) {
       throw new Error(
-        'WhatsApp connection closed before the pairing code could be requested. Please try again later.'
+        'WhatsApp socket closed before pairing. Check the Render logs for WHATSAPP DISCONNECT DETAILS.'
       );
     }
 
@@ -416,6 +429,12 @@ export async function startUserSession(
     } catch {
       // Socket may already be closed.
     }
+
+    console.error('PAIRING REQUEST FAILED:', {
+      userId,
+      message: error.message,
+      stack: error.stack
+    });
 
     throw error;
   }
