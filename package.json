@@ -1,22 +1,22 @@
-
 {
   "name": "scanty-md-bot",
   "version": "1.0.0",
-  "description": "SCANTY MD BOT - WhatsApp status automation project",
+  "description": "SCANTY MD BOT - WhatsApp automation platform",
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node --watch index.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
   "engines": {
     "node": ">=20"
   },
-"dependencies": {
-  "@whiskeysockets/baileys": "^6.7.24",
-  "dotenv": "^16.4.7",
-  "pino": "^9.6.0",
-  "pg": "^8.13.1",
-  "bcryptjs": "^2.4.3",
-  "jsonwebtoken": "^9.0.2"
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.24",
+    "dotenv": "^16.4.7",
+    "pino": "^9.6.0",
+    "pg": "^8.13.1",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2"
+  }
 }
