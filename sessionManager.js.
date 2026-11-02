@@ -1,0 +1,68 @@
+
+import makeWASocket, {
+  useMultiFileAuthState
+} from '@whiskeysockets/baileys';
+
+import pino from 'pino';
+import path from 'node:path';
+import fs from 'node:fs/promises';
+
+const sessions = new Map();
+
+const SESSION_DIR = path.resolve('./private_sessions');
+
+export async function startUserSession(userId, phoneNumber, onPairingCode) {
+  if (!/^[a-f0-9-]{16,64}$/i.test(userId)) {
+    throw new Error('Invalid user ID');
+  }
+
+  if (!/^\d{10,15}$/.test(phoneNumber)) {
+    throw new Error('Enter your country code and phone number using digits only.');
+  }
+
+  if (sessions.has(userId)) {
+    throw new Error('This user already has an active session.');
+  }
+
+  await fs.mkdir(SESSION_DIR, { recursive: true });
+
+  const userSessionDir = path.join(SESSION_DIR, userId);
+  const { state, saveCreds } =
+    await useMultiFileAuthState(userSessionDir);
+
+  const sock = makeWASocket({
+    auth: state,
+    logger: pino({ level: 'silent' }),
+    markOnlineOnConnect: false
+  });
+
+  sessions.set(userId, sock);
+
+  sock.ev.on('creds.update', saveCreds);
+
+  let codeRequested = false;
+
+  sock.ev.on('connection.update', async ({ qr, connection }) => {
+    if (qr && !sock.authState.creds.registered && !codeRequested) {
+      codeRequested = true;
+
+      try {
+        const code = await sock.requestPairingCode(phoneNumber);
+        onPairingCode(code);
+      } catch (error) {
+        console.error('Pairing request failed:', error.message);
+        sessions.delete(userId);
+      }
+    }
+
+    if (connection === 'open') {
+      console.log(`A user connected: ${userId}`);
+    }
+
+    if (connection === 'close') {
+      sessions.delete(userId);
+    }
+  });
+
+  return { started: true };
+}
