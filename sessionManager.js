@@ -2,7 +2,8 @@
 import makeWASocket, {
   initAuthCreds,
   BufferJSON,
-  proto
+  proto,
+  Browsers
 } from '@whiskeysockets/baileys';
 
 import pino from 'pino';
@@ -220,8 +221,7 @@ function attachSocket(userId, state, captureQr = false) {
     logger: pino({ level: 'info' }),
     printQRInTerminal: false,
     markOnlineOnConnect: false,
-    browser: ['SCANTY MD BOT', 'Chrome', '120.0.0']
-  });
+    browser: Browsers.macOS('Chrome')
 
   sessions.set(userId, sock);
   sessionStatus.set(userId, 'connecting');
