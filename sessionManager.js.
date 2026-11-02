@@ -8,7 +8,6 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 
 const sessions = new Map();
-
 const SESSION_DIR = path.resolve('./private_sessions');
 
 export async function startUserSession(userId, phoneNumber, onPairingCode) {
@@ -17,7 +16,7 @@ export async function startUserSession(userId, phoneNumber, onPairingCode) {
   }
 
   if (!/^\d{10,15}$/.test(phoneNumber)) {
-    throw new Error('Enter your country code and phone number using digits only.');
+    throw new Error('Use digits only, including your country code.');
   }
 
   if (sessions.has(userId)) {
@@ -26,37 +25,27 @@ export async function startUserSession(userId, phoneNumber, onPairingCode) {
 
   await fs.mkdir(SESSION_DIR, { recursive: true });
 
-  const userSessionDir = path.join(SESSION_DIR, userId);
+  const folder = path.join(SESSION_DIR, userId);
   const { state, saveCreds } =
-    await useMultiFileAuthState(userSessionDir);
+    await useMultiFileAuthState(folder);
+
+  if (state.creds.registered) {
+    throw new Error('This account is already registered.');
+  }
 
   const sock = makeWASocket({
     auth: state,
     logger: pino({ level: 'silent' }),
+    printQRInTerminal: false,
     markOnlineOnConnect: false
   });
 
   sessions.set(userId, sock);
-
   sock.ev.on('creds.update', saveCreds);
 
-  let codeRequested = false;
-
-  sock.ev.on('connection.update', async ({ qr, connection }) => {
-    if (qr && !sock.authState.creds.registered && !codeRequested) {
-      codeRequested = true;
-
-      try {
-        const code = await sock.requestPairingCode(phoneNumber);
-        onPairingCode(code);
-      } catch (error) {
-        console.error('Pairing request failed:', error.message);
-        sessions.delete(userId);
-      }
-    }
-
+  sock.ev.on('connection.update', ({ connection }) => {
     if (connection === 'open') {
-      console.log(`A user connected: ${userId}`);
+      console.log(`User connected: ${userId}`);
     }
 
     if (connection === 'close') {
@@ -64,5 +53,12 @@ export async function startUserSession(userId, phoneNumber, onPairingCode) {
     }
   });
 
-  return { started: true };
+  try {
+    const code = await sock.requestPairingCode(phoneNumber);
+    onPairingCode(code);
+    return { started: true };
+  } catch (error) {
+    sessions.delete(userId);
+    throw error;
+  }
 }
