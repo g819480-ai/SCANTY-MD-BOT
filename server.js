@@ -1,8 +1,14 @@
+
 import 'dotenv/config';
 import http from 'node:http';
 import pg from 'pg';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+
+import {
+  initializeSessionStorage,
+  startUserSession
+} from './sessionManager.js';
 
 const { Pool } = pg;
 
@@ -11,6 +17,7 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const JWT_SECRET = process.env.JWT_SECRET;
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL?.trim().toLowerCase();
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+
 const DASHBOARD_ORIGIN =
   process.env.DASHBOARD_ORIGIN ||
   'https://scanty-md-dashboard.g819480.workers.dev';
@@ -25,7 +32,7 @@ if (
   Buffer.byteLength(ADMIN_PASSWORD, 'utf8') > 72 ||
   ADMIN_PASSWORD.length < 12
 ) {
-  throw new Error('Set ADMIN_EMAIL and an ADMIN_PASSWORD of at least 12 characters (maximum 72 bytes).');
+  throw new Error('Set ADMIN_EMAIL and an ADMIN_PASSWORD of at least 12 characters.');
 }
 
 const pool = new Pool({
@@ -123,7 +130,8 @@ async function initializeDatabase() {
   `);
 
   await pool.query(`
-    UPDATE users SET role = 'user'
+    UPDATE users
+    SET role = 'user'
     WHERE role IS NULL OR role NOT IN ('user', 'admin')
   `);
 
@@ -132,19 +140,16 @@ async function initializeDatabase() {
   await pool.query(
     `INSERT INTO users (email, password_hash, role)
      VALUES ($1, $2, 'admin')
-     ON CONFLICT (email)
-     DO UPDATE SET
-       password_hash = EXCLUDED.password_hash,
-       role = 'admin'`,
+     ON CONFLICT (email) DO NOTHING`,
     [ADMIN_EMAIL, passwordHash]
   );
 
-  console.log('Database initialized. Admin account is ready.');
+  console.log('Database initialized.');
 }
 
 const rateLimits = new Map();
 
-function rateLimit(req, res) {
+function rateLimit(req, res, limit = 20) {
   const key = `${req.socket.remoteAddress}:${req.url}`;
   const now = Date.now();
   const previous = rateLimits.get(key);
@@ -156,8 +161,10 @@ function rateLimit(req, res) {
 
   previous.count += 1;
 
-  if (previous.count > 20) {
-    send(res, 429, { error: 'Too many requests. Try again later.' });
+  if (previous.count > limit) {
+    send(res, 429, {
+      error: 'Too many requests. Please try again later.'
+    });
     return true;
   }
 
@@ -200,10 +207,45 @@ async function handleRequest(req, res) {
     `http://${req.headers.host || 'localhost'}`
   );
 
+  // Health checks
+
+  if (req.method === 'GET' && url.pathname === '/') {
+    return send(res, 200, {
+      success: true,
+      name: 'SCANTY MD BOT',
+      status: 'running'
+    });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/health') {
+    return send(res, 200, { status: 'online' });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/db-health') {
+    try {
+      await pool.query('SELECT NOW()');
+
+      return send(res, 200, {
+        status: 'connected',
+        database: 'Neon PostgreSQL'
+      });
+    } catch (error) {
+      console.error('Database health error:', error.message);
+
+      return send(res, 503, {
+        status: 'disconnected'
+      });
+    }
+  }
+
+  // Registration and login
+
   if (
     req.method === 'POST' &&
-    (url.pathname === '/api/auth/register' ||
-     url.pathname === '/api/auth/login')
+    (
+      url.pathname === '/api/auth/register' ||
+      url.pathname === '/api/auth/login'
+    )
   ) {
     if (rateLimit(req, res)) return;
 
@@ -212,14 +254,18 @@ async function handleRequest(req, res) {
     try {
       body = await readBody(req);
     } catch {
-      return send(res, 400, { error: 'Invalid request body.' });
+      return send(res, 400, {
+        error: 'Invalid request body.'
+      });
     }
 
     const email = String(body.email || '').trim().toLowerCase();
     const password = body.password;
 
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return send(res, 400, { error: 'Enter a valid email address.' });
+      return send(res, 400, {
+        error: 'Enter a valid email address.'
+      });
     }
 
     if (
@@ -265,6 +311,7 @@ async function handleRequest(req, res) {
         }
 
         console.error('Registration error:', error.message);
+
         return send(res, 500, {
           error: 'Registration could not be completed.'
         });
@@ -274,7 +321,8 @@ async function handleRequest(req, res) {
     try {
       const result = await pool.query(
         `SELECT id, email, password_hash, role, created_at
-         FROM users WHERE email = $1`,
+         FROM users
+         WHERE email = $1`,
         [email]
       );
 
@@ -298,55 +346,110 @@ async function handleRequest(req, res) {
       });
     } catch (error) {
       console.error('Login error:', error.message);
-      return send(res, 500, { error: 'Login could not be completed.' });
-    }
-  }
 
-  if (req.method === 'GET' && url.pathname === '/') {
-    return send(res, 200, {
-      success: true,
-      name: 'SCANTY MD BOT',
-      status: 'running'
-    });
-  }
-
-  if (req.method === 'GET' && url.pathname === '/health') {
-    return send(res, 200, { status: 'online' });
-  }
-
-  if (req.method === 'GET' && url.pathname === '/db-health') {
-    try {
-      await pool.query('SELECT NOW()');
-
-      return send(res, 200, {
-        status: 'connected',
-        database: 'Neon PostgreSQL'
+      return send(res, 500, {
+        error: 'Login could not be completed.'
       });
-    } catch (error) {
-      console.error('Database health error:', error.message);
-      return send(res, 503, { status: 'disconnected' });
     }
   }
+
+  // Current logged-in user
 
   if (req.method === 'GET' && url.pathname === '/api/auth/me') {
     const user = await authenticatedUser(req);
 
     if (!user) {
-      return send(res, 401, { error: 'Please log in again.' });
+      return send(res, 401, {
+        error: 'Please log in again.'
+      });
     }
 
-    return send(res, 200, { success: true, user });
+    return send(res, 200, {
+      success: true,
+      user
+    });
   }
+
+  // WhatsApp pairing code
+
+  if (
+    req.method === 'POST' &&
+    url.pathname === '/api/whatsapp/pair'
+  ) {
+    if (rateLimit(req, res, 5)) return;
+
+    const user = await authenticatedUser(req);
+
+    if (!user) {
+      return send(res, 401, {
+        error: 'Please log in before connecting WhatsApp.'
+      });
+    }
+
+    let body;
+
+    try {
+      body = await readBody(req);
+    } catch {
+      return send(res, 400, {
+        error: 'Invalid request body.'
+      });
+    }
+
+    const phoneNumber = String(body.phoneNumber || '').replace(/[\s+()-]/g, '');
+
+    if (!/^\d{10,15}$/.test(phoneNumber)) {
+      return send(res, 400, {
+        error: 'Enter your phone number with country code, using digits only.'
+      });
+    }
+
+    try {
+      let pairingCode = null;
+
+      await startUserSession(
+        user.id,
+        phoneNumber,
+        code => {
+          pairingCode = code;
+        }
+      );
+
+      if (!pairingCode) {
+        return send(res, 500, {
+          error: 'The pairing code could not be generated.'
+        });
+      }
+
+      return send(res, 200, {
+        success: true,
+        message: 'Pairing code generated. Enter it in WhatsApp Linked Devices.',
+        pairingCode
+      });
+    } catch (error) {
+      console.error('WhatsApp pairing error:', error.message);
+
+      return send(res, 400, {
+        error: error.message || 'Could not start WhatsApp pairing.'
+      });
+    }
+  }
+
+  // Admin dashboard
 
   if (
     req.method === 'GET' &&
-    (url.pathname === '/api/admin/stats' ||
-     url.pathname === '/api/admin/users')
+    (
+      url.pathname === '/api/admin/stats' ||
+      url.pathname === '/api/admin/users'
+    )
   ) {
     const user = await authenticatedUser(req);
 
     if (!user || user.role !== 'admin') {
-      return send(res, 403, { error: 'Administrator access required.' });
+      return send(res, 403, {
+        error: 'Administrator access required.'
+      });
     }
 
     try {
@@ -378,22 +481,31 @@ async function handleRequest(req, res) {
       });
     } catch (error) {
       console.error('Admin request error:', error.message);
-      return send(res, 500, { error: 'Could not load admin data.' });
+
+      return send(res, 500, {
+        error: 'Could not load admin data.'
+      });
     }
   }
 
-  return send(res, 404, { error: 'Route not found.' });
+  return send(res, 404, {
+    error: 'Route not found.'
+  });
 }
 
 async function startServer() {
   await initializeDatabase();
+
+  await initializeSessionStorage();
 
   const server = http.createServer((req, res) => {
     handleRequest(req, res).catch(error => {
       console.error('Request error:', error.message);
 
       if (!res.headersSent) {
-        send(res, 500, { error: 'Internal server error.' });
+        send(res, 500, {
+          error: 'Internal server error.'
+        });
       } else {
         res.end();
       }
