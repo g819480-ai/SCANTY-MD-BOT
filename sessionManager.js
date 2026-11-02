@@ -4,6 +4,7 @@ import pino from 'pino';
 import crypto from 'node:crypto';
 import pg from 'pg';
 import { handleIncomingMessage } from './messageHandler.js';
+
 const { Pool } = pg;
 const sessions = new Map();
 const sessionStatus = new Map();
@@ -136,13 +137,14 @@ function attachSocket(userId, sock) {
   sessions.set(userId, sock);
   sessionStatus.set(userId, 'connecting');
 
-  sock.ev.on('creds.update', async () => {
-    try {
-      await saveRecord(userId, 'creds', 'main', state.creds);
-    } catch (error) {
-      console.error('Could not save credentials:', error.message);
-    }
-  });
+  
+      sock.ev.on('messages.upsert', async ({ messages, type }) => {
+  if (type !== 'notify') return;
+
+  for (const message of messages) {
+    await handleIncomingMessage(sock, userId, message);
+  }
+});
 
   
     }
