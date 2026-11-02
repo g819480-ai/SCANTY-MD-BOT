@@ -13,8 +13,8 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "6.7.23"
-    "dotenv": "^16.4.7",
+    "@whiskeysockets/baileys": "6.7.23",
+"dotenv": "^16.4.7",
     "pino": "^9.6.0",
     "pg": "^8.13.1",
     "bcryptjs": "^2.4.3",
