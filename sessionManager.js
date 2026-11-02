@@ -18,6 +18,7 @@ const { Pool } = pg;
 const sessions = new Map();
 const sessionStatus = new Map();
 const presenceTimers = new Map();
+const qrStates = new Map();
 
 const secret = process.env.SESSION_ENCRYPTION_KEY?.trim();
 
@@ -213,13 +214,10 @@ function startPresenceHeartbeat(userId, sock) {
   presenceTimers.set(userId, timer);
 }
 
-function attachSocket(userId, state) {
+function attachSocket(userId, state, captureQr = false) {
   const sock = makeWASocket({
     auth: state,
-
-    // Enable logs so we can identify pairing failures.
     logger: pino({ level: 'info' }),
-
     printQRInTerminal: false,
     markOnlineOnConnect: false,
     browser: ['SCANTY MD BOT', 'Chrome', '120.0.0']
@@ -260,11 +258,29 @@ function attachSocket(userId, state) {
 
   sock.ev.on(
     'connection.update',
-    async ({ connection, lastDisconnect }) => {
+    async ({ connection, lastDisconnect, qr }) => {
       if (sessions.get(userId) !== sock) return;
+
+      if (captureQr && qr) {
+        qrStates.set(userId, {
+          qr,
+          status: 'qr',
+          updatedAt: Date.now()
+        });
+
+        console.log(`WhatsApp QR generated for user ${userId}.`);
+      }
 
       if (connection === 'open') {
         sessionStatus.set(userId, 'connected');
+
+        if (captureQr) {
+          qrStates.set(userId, {
+            qr: null,
+            status: 'connected',
+            updatedAt: Date.now()
+          });
+        }
 
         console.log(
           `WhatsApp connected for user ${userId}`
@@ -275,10 +291,30 @@ function attachSocket(userId, state) {
 
       if (connection === 'connecting') {
         sessionStatus.set(userId, 'connecting');
+
+        if (captureQr && !qr) {
+          const current = qrStates.get(userId);
+
+          if (!current || current.status !== 'qr') {
+            qrStates.set(userId, {
+              qr: null,
+              status: 'connecting',
+              updatedAt: Date.now()
+            });
+          }
+        }
       }
 
       if (connection === 'close') {
         sessionStatus.set(userId, 'disconnected');
+
+        if (captureQr) {
+          qrStates.set(userId, {
+            qr: null,
+            status: 'disconnected',
+            updatedAt: Date.now()
+          });
+        }
 
         stopPresenceHeartbeat(userId);
 
@@ -361,6 +397,58 @@ export function getUserSessionStatus(userId) {
   return sessionStatus.get(userId) || 'not_connected';
 }
 
+export function getUserQrState(userId) {
+  const state = qrStates.get(userId);
+
+  if (!state) {
+    return {
+      qr: null,
+      status: getUserSessionStatus(userId)
+    };
+  }
+
+  return {
+    qr: state.qr,
+    status: state.status
+  };
+}
+
+export async function startUserQrSession(userId) {
+  if (!/^[a-f0-9-]{16,64}$/i.test(userId)) {
+    throw new Error('Invalid user ID.');
+  }
+
+  if (sessions.has(userId)) {
+    throw new Error(
+      'A WhatsApp session is already active for this user.'
+    );
+  }
+
+  const savedCreds = await readRecord(
+    userId,
+    'creds',
+    'main'
+  );
+
+  if (savedCreds?.registered) {
+    throw new Error(
+      'This WhatsApp account is already linked.'
+    );
+  }
+
+  const state = makeAuthState(userId, savedCreds);
+
+  qrStates.set(userId, {
+    qr: null,
+    status: 'connecting',
+    updatedAt: Date.now()
+  });
+
+  attachSocket(userId, state, true);
+
+  return { started: true };
+}
+
 export async function startUserSession(
   userId,
   phoneNumber,
@@ -394,11 +482,12 @@ export async function startUserSession(
     );
   }
 
+  qrStates.delete(userId);
+
   const state = makeAuthState(userId, savedCreds);
   const sock = attachSocket(userId, state);
 
   try {
-    // Wait briefly for the socket to start.
     await delay(1500);
 
     if (
