@@ -64,8 +64,29 @@ async function startServer() {
   console.log('Neon database connected.');
 
   const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    const url = new URL(req.url, `http://${req.headers.host || '    const allowedOrigin =
+      'https://scanty-md-dashboard.g819480.workers.dev';
 
+    const origin = req.headers.origin;
+
+    if (origin === allowedOrigin) {
+      res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
+    }
+
+    res.setHeader('Vary', 'Origin');
+    res.setHeader(
+      'Access-Control-Allow-Methods',
+      'GET, POST, OPTIONS'
+    );
+    res.setHeader(
+      'Access-Control-Allow-Headers',
+      'Content-Type, Authorization'
+    );
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      return res.end();
+    }
     if (req.method === 'GET' && url.pathname === '/') {
       return send(res, 200, {
         success: true,
