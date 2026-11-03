@@ -1,3 +1,4 @@
+
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
@@ -161,9 +162,9 @@ test('retry exhaustion cleans current in-memory socket/controller and permits a 
     onExhausted: expectedSocket => {
       cleanupResult = cleanupExhaustedReconnect({
         userId: 'user',
+        ...maps,
         expectedSocket,
         controller,
-        ...maps,
         stopPresence: () => { stoppedPresence += 1; }
       });
     },
