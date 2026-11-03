@@ -12,7 +12,7 @@ export function shouldReconnect(statusCode, reasons) {
 }
 
 export function reconnectDelay(attempt, statusCode, reasons) {
-  if (statusCode === reasons.restartRequired) return 0;
+  if (attempt === 0 && statusCode === reasons.restartRequired) return 0;
   const boundedAttempt = Math.max(0, Math.min(attempt, 6));
   return Math.min(1000 * (2 ** boundedAttempt), 30000);
 }
@@ -29,36 +29,37 @@ export function createReconnectController({
   let timer;
   let stopped = false;
 
+  const queueAttempt = (statusCode, socketIdentity) => {
+    if (stopped || attempt >= maxAttempts) {
+      onState('disconnected');
+      return false;
+    }
+    if (timer) return true;
+
+    const attemptNumber = attempt++;
+    const wait = reconnectDelay(attemptNumber, statusCode, reasons);
+    onState('reconnecting');
+    timer = setTimeoutFn(async () => {
+      timer = undefined;
+      if (stopped) return;
+      try {
+        // Identity is captured at scheduling time and passed through every retry.
+        await reconnect(socketIdentity);
+      } catch (error) {
+        onState('reconnect_failed', error);
+        queueAttempt(undefined, socketIdentity);
+      }
+    }, wait);
+    return true;
+  };
+
   return {
-    schedule(statusCode) {
-      if (stopped || !shouldReconnect(statusCode, reasons) || attempt >= maxAttempts) {
+    schedule(statusCode, socketIdentity) {
+      if (stopped || !shouldReconnect(statusCode, reasons)) {
         onState('disconnected');
         return false;
       }
-      if (timer) clearTimeoutFn(timer);
-      const wait = reconnectDelay(attempt, statusCode, reasons);
-      attempt += 1;
-      onState('reconnecting');
-      timer = setTimeoutFn(async () => {
-        timer = undefined;
-        if (stopped) return;
-        try {
-          await reconnect();
-        } catch (error) {
-          onState('reconnect_failed', error);
-          // Retry transient failures through the normal bounded backoff path.
-          if (!stopped && attempt < maxAttempts) {
-            timer = setTimeoutFn(async () => {
-              timer = undefined;
-              if (stopped) return;
-              try { await reconnect(); } catch (nextError) {
-                onState('reconnect_failed', nextError);
-              }
-            }, reconnectDelay(attempt++, undefined, reasons));
-          }
-        }
-      }, wait);
-      return true;
+      return queueAttempt(statusCode, socketIdentity);
     },
     connected() {
       attempt = 0;
@@ -71,7 +72,8 @@ export function createReconnectController({
       if (timer) clearTimeoutFn(timer);
       timer = undefined;
     },
-    get attempt() { return attempt; }
+    get attempt() { return attempt; },
+    get stopped() { return stopped; }
   };
 }
 
@@ -111,7 +113,6 @@ export function waitForSocketReady(sock, timeoutMs = 20000) {
       ws.off?.('open', onOpen);
       ws.off?.('error', onError);
       ws.off?.('close', onClose);
-      // Support EventEmitter implementations that only expose removeListener.
       ws.removeListener?.('open', onOpen);
       ws.removeListener?.('error', onError);
       ws.removeListener?.('close', onClose);

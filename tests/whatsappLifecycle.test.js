@@ -18,47 +18,113 @@ const reasons = {
   timedOut: 408
 };
 
+function fakeTimers() {
+  let nextId = 0;
+  const callbacks = new Map();
+  return {
+    callbacks,
+    setTimeoutFn(fn, ms) {
+      const id = ++nextId;
+      callbacks.set(id, { fn, ms });
+      return id;
+    },
+    clearTimeoutFn(id) { callbacks.delete(id); },
+    async runNext() {
+      const entry = callbacks.entries().next().value;
+      if (!entry) return false;
+      const [id, timer] = entry;
+      callbacks.delete(id);
+      await timer.fn();
+      return timer.ms;
+    }
+  };
+}
+
 test('restartRequired immediately reconnects; terminal reasons do not', () => {
   assert.equal(shouldReconnect(515, reasons), true);
-  assert.equal(reconnectDelay(3, 515, reasons), 0);
+  assert.equal(reconnectDelay(0, 515, reasons), 0);
   assert.equal(shouldReconnect(401, reasons), false);
   assert.equal(shouldReconnect(440, reasons), false);
   assert.equal(shouldReconnect(500, reasons), false);
   assert.equal(shouldReconnect(408, reasons), true);
 });
 
-test('reconnect controller invokes replacement callback and resets attempts on open', async () => {
-  let callback;
-  let reconnects = 0;
-  const states = [];
+test('consecutive reconnect failures retry to the configured maximum', async () => {
+  const timers = fakeTimers();
+  let attempts = 0;
   const controller = createReconnectController({
-    reconnect: async () => { reconnects += 1; },
-    onState: state => states.push(state),
-    setTimeoutFn: fn => { callback = fn; return 1; },
-    clearTimeoutFn: () => {},
+    reconnect: async () => { attempts += 1; throw new Error('offline'); },
+    setTimeoutFn: timers.setTimeoutFn,
+    clearTimeoutFn: timers.clearTimeoutFn,
+    maxAttempts: 4,
     reasons
   });
 
-  assert.equal(controller.schedule(515), true);
-  assert.equal(states.at(-1), 'reconnecting');
-  await callback();
-  assert.equal(reconnects, 1);
-  controller.connected();
-  assert.equal(controller.attempt, 0);
-  assert.equal(states.at(-1), 'connected');
-  controller.stop();
+  assert.equal(controller.schedule(408, 'socket-A'), true);
+  const delays = [];
+  while (timers.callbacks.size) delays.push(await timers.runNext());
+  assert.equal(attempts, 4);
+  assert.equal(controller.attempt, 4);
+  assert.deepEqual(delays, [1000, 2000, 4000, 8000]);
+  assert.equal(controller.schedule(408, 'socket-A'), false);
 });
 
-test('stale socket cannot trigger a replacement after a newer socket is installed', async () => {
+test('stop cancels scheduled reconnect and prevents further attempts', async () => {
+  const timers = fakeTimers();
+  let attempts = 0;
+  const controller = createReconnectController({
+    reconnect: async () => { attempts += 1; },
+    setTimeoutFn: timers.setTimeoutFn,
+    clearTimeoutFn: timers.clearTimeoutFn,
+    reasons
+  });
+  controller.schedule(408, 'socket-A');
+  controller.stop();
+  assert.equal(timers.callbacks.size, 0);
+  assert.equal(await timers.runNext(), false);
+  assert.equal(attempts, 0);
+});
+
+test('scheduled reconnect retains socket identity and cannot replace a newer socket', async () => {
+  const timers = fakeTimers();
   const oldSocket = {};
-  const currentSocket = {};
+  const newSocket = {};
+  let currentSocket = oldSocket;
   let reconnects = 0;
-  assert.equal(await reconnectIfCurrent({
-    currentSocket,
-    expectedSocket: oldSocket,
-    reconnect: async () => { reconnects += 1; }
-  }), false);
+  const controller = createReconnectController({
+    reconnect: identity => reconnectIfCurrent({
+      currentSocket,
+      expectedSocket: identity,
+      reconnect: async () => { reconnects += 1; }
+    }),
+    setTimeoutFn: timers.setTimeoutFn,
+    clearTimeoutFn: timers.clearTimeoutFn,
+    reasons
+  });
+
+  controller.schedule(408, oldSocket);
+  currentSocket = newSocket;
+  await timers.runNext();
   assert.equal(reconnects, 0);
+});
+
+test('successful reconnection resets retry count', async () => {
+  const timers = fakeTimers();
+  let attempts = 0;
+  const controller = createReconnectController({
+    reconnect: async () => { attempts += 1; },
+    setTimeoutFn: timers.setTimeoutFn,
+    clearTimeoutFn: timers.clearTimeoutFn,
+    reasons
+  });
+  controller.schedule(408, 'socket-A');
+  await timers.runNext();
+  assert.equal(attempts, 1);
+  controller.connected();
+  assert.equal(controller.attempt, 0);
+  controller.schedule(408, 'socket-B');
+  assert.equal((await timers.runNext()), 1000);
+  assert.equal(attempts, 2);
 });
 
 test('pairing lock rejects concurrent pairing and releases after completion', async () => {
