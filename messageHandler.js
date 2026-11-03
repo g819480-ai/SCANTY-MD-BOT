@@ -31,6 +31,12 @@ function getMentionedJids(message) {
   return context?.mentionedJid || [];
 }
 
+function normalizeJid(jid) {
+  if (!jid) return '';
+  const [user, server] = jid.split('@');
+  return `${user.split(':')[0]}@${server || ''}`;
+}
+
 function getParticipantJid(jid) {
   return jid?.split(':')[0];
 }
@@ -47,12 +53,22 @@ async function isGroupAdmin(sock, chatId, senderJid) {
 
 export async function handleIncomingMessage(sock, userId, message) {
   try {
-    if (!message?.key || message.key.fromMe) return;
+    if (!message?.key) return;
 
     const chatId = message.key.remoteJid;
 
     if (!chatId || chatId === 'status@broadcast') return;
     if (chatId.endsWith('@newsletter')) return;
+
+    // Permit commands sent in the linked account's own 1:1 self-chat so the
+    // owner can test/control the bot from the linked device. Continue ignoring
+    // messages sent by the bot to other chats to prevent reply loops.
+    const isOwnerSelfChat =
+      message.key.fromMe === true &&
+      !chatId.endsWith('@g.us') &&
+      normalizeJid(chatId) === normalizeJid(sock.user?.id);
+
+    if (message.key.fromMe && !isOwnerSelfChat) return;
 
     const text = getMessageText(message);
     if (!text.startsWith(PREFIX)) return;
@@ -81,6 +97,7 @@ export async function handleIncomingMessage(sock, userId, message) {
 ┣━━ GENERAL ━━
 ┃ .menu
 ┃ .ping
+┃ .status
 ┃ .settings
 ┃
 ┣━━ STATUS ━━
@@ -113,6 +130,11 @@ SCANTY MD BOT
 
       case 'ping':
         return reply('🏓 SCANTY MD BOT is online!');
+
+      case 'status':
+        return reply(
+          `✅ SCANTY MD BOT is connected.\nAccount: ${sock.user?.id || 'unknown'}\nCommand prefix: ${PREFIX}`
+        );
 
       case 'settings':
         return reply(`
