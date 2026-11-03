@@ -438,7 +438,7 @@ async function handleRequest(req, res) {
     req.method === 'POST' &&
     url.pathname === '/api/whatsapp/qr'
   ) {
-    if (rateLimit(req, res, 5)) return;
+    
 
     const user = await authenticatedUser(req);
 
