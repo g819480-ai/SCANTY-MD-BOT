@@ -50,6 +50,30 @@ function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function normalizeQrValue(qr) {
+  if (!qr) return null;
+
+  if (typeof qr === 'string') {
+    return qr;
+  }
+
+  if (Buffer.isBuffer(qr)) {
+    return qr.toString('base64');
+  }
+
+  if (typeof qr === 'object') {
+    if (typeof qr.data !== 'undefined') {
+      return Buffer.from(qr.data).toString('base64');
+    }
+
+    if (typeof qr.toString === 'function' && qr.toString() !== '[object Object]') {
+      return qr.toString();
+    }
+  }
+
+  return String(qr);
+}
+
 function encrypt(value) {
   const iv = crypto.randomBytes(12);
 
@@ -217,7 +241,6 @@ function startPresenceHeartbeat(userId, sock) {
   presenceTimers.set(userId, timer);
 }
 
-// Send the welcome image and text as two separate messages.
 async function sendScantyWelcome(userId, sock) {
   try {
     const alreadyWelcomed = await readRecord(
@@ -245,13 +268,11 @@ async function sendScantyWelcome(userId, sock) {
       new URL('./scanty-md-welcome-final.jpg', import.meta.url)
     );
 
-    // First message: picture only.
     await sock.sendMessage(ownJid, {
       image,
       mimetype: 'image/jpeg'
     });
 
-    // Second message: text only.
     await sock.sendMessage(ownJid, {
       text:
         '✅ Bot Connected Successfully\n\n' +
@@ -358,8 +379,10 @@ async function attachSocket(userId, state, captureQr = false) {
         statusCode === DisconnectReason.restartRequired;
 
       if (captureQr && qr) {
+        const normalizedQr = normalizeQrValue(qr);
+
         qrStates.set(userId, {
-          qr,
+          qr: normalizedQr,
           status: 'qr',
           updatedAt: Date.now()
         });
@@ -522,9 +545,16 @@ export async function startUserQrSession(userId) {
   }
 
   if (sessions.has(userId)) {
-    throw new Error(
-      'A WhatsApp session is already active for this user.'
-    );
+    const staleSocket = sessions.get(userId);
+    if (staleSocket && typeof staleSocket.end === 'function') {
+      try {
+        staleSocket.end(new Error('Restarting QR session.'));
+      } catch {
+        // no-op
+      }
+    }
+    sessions.delete(userId);
+    stopPresenceHeartbeat(userId);
   }
 
   const savedCreds = await readRecord(
