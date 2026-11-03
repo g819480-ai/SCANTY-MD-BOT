@@ -1,3 +1,4 @@
+
 import makeWASocket, {
   initAuthCreds,
   BufferJSON,
@@ -66,7 +67,10 @@ function normalizeQrValue(qr) {
       return Buffer.from(qr.data).toString('base64');
     }
 
-    if (typeof qr.toString === 'function' && qr.toString() !== '[object Object]') {
+    if (
+      typeof qr.toString === 'function' &&
+      qr.toString() !== '[object Object]'
+    ) {
       return qr.toString();
     }
   }
@@ -293,7 +297,7 @@ async function sendScantyWelcome(userId, sock) {
     console.log(`SCANTY MD welcome sequence sent for ${userId}`);
   } catch (error) {
     console.error(
-      `SCANTY MD welcome sequence failed for ${userId}:`,
+      'SCANTY MD welcome sequence failed:',
       error.message
     );
   }
@@ -347,10 +351,31 @@ async function attachSocket(userId, state, captureQr = false) {
     }
   });
 
+  // Incoming WhatsApp message diagnostics
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    console.log('[WA MESSAGE EVENT]', {
+      userId,
+      eventType: type,
+      messageCount: messages?.length || 0,
+      incomingCount: messages?.filter(
+        message => !message.key?.fromMe
+      ).length || 0
+    });
+
     if (type !== 'notify') return;
 
     for (const message of messages) {
+      console.log('[WA MESSAGE RECEIVED]', {
+        userId,
+        fromMe: Boolean(message.key?.fromMe),
+        chatType: message.key?.remoteJid?.endsWith('@g.us')
+          ? 'group'
+          : message.key?.remoteJid?.endsWith('@s.whatsapp.net')
+            ? 'private'
+            : 'other',
+        messageTypes: Object.keys(message.message || {})
+      });
+
       try {
         if (message.key?.remoteJid === 'status@broadcast') {
           await handleStatusUpdate(sock, userId, message);
@@ -372,6 +397,7 @@ async function attachSocket(userId, state, captureQr = false) {
       if (sessions.get(userId) !== sock) return;
 
       const statusCode = lastDisconnect?.error?.output?.statusCode;
+
       const isTerminalDisconnect =
         statusCode === DisconnectReason.loggedOut ||
         statusCode === DisconnectReason.connectionReplaced ||
@@ -546,6 +572,7 @@ export async function startUserQrSession(userId) {
 
   if (sessions.has(userId)) {
     const staleSocket = sessions.get(userId);
+
     if (staleSocket && typeof staleSocket.end === 'function') {
       try {
         staleSocket.end(new Error('Restarting QR session.'));
@@ -553,6 +580,7 @@ export async function startUserQrSession(userId) {
         // no-op
       }
     }
+
     sessions.delete(userId);
     stopPresenceHeartbeat(userId);
   }
