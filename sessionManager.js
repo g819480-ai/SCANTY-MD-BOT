@@ -16,6 +16,7 @@ import { handleIncomingMessage } from './messageHandler.js';
 import { handleStatusUpdate } from './statusEvents.js';
 import { getFeatureSettings } from './featureSettings.js';
 import {
+  cleanupExhaustedReconnect,
   createReconnectController,
   reconnectIfCurrent,
   waitForSocketReady,
@@ -23,7 +24,6 @@ import {
 } from './whatsappLifecycle.js';
 
 const { Pool } = pg;
-
 const sessions = new Map();
 const sessionStatus = new Map();
 const presenceTimers = new Map();
@@ -91,8 +91,7 @@ async function saveRecord(userId, type, id, value) {
 
 async function readRecord(userId, type, id) {
   const result = await pool.query(
-    `SELECT encrypted_data FROM whatsapp_sessions
-     WHERE user_id=$1 AND record_type=$2 AND record_id=$3`,
+    `SELECT encrypted_data FROM whatsapp_sessions WHERE user_id=$1 AND record_type=$2 AND record_id=$3`,
     [userId, type, id]
   );
   if (!result.rows[0]) return null;
@@ -174,18 +173,32 @@ async function sendScantyWelcome(userId, sock) {
 }
 
 function getReconnectController(userId, state, captureQr) {
-  reconnectContexts.set(userId, { state, captureQr });
-  if (reconnectControllers.has(userId)) return reconnectControllers.get(userId);
+  const existing = reconnectControllers.get(userId);
+  if (existing) return existing;
 
-  const controller = createReconnectController({
+  let controller;
+  controller = createReconnectController({
     reasons: DisconnectReason,
     maxAttempts: 10,
     onState: status => {
       if (status === 'reconnecting' || status === 'disconnected') sessionStatus.set(userId, status);
     },
+    onExhausted: expectedSocket => {
+      cleanupExhaustedReconnect({
+        userId,
+        expectedSocket,
+        controller,
+        sessions,
+        sessionStatus,
+        reconnectControllers,
+        reconnectContexts,
+        qrStates,
+        stopPresence: stopPresenceHeartbeat
+      });
+    },
     reconnect: async expectedSocket => {
       const context = reconnectContexts.get(userId);
-      if (!context || sessions.get(userId) !== expectedSocket) return;
+      if (!context || context.controller !== controller || sessions.get(userId) !== expectedSocket) return;
       await reconnectIfCurrent({
         currentSocket: sessions.get(userId),
         expectedSocket,
@@ -194,13 +207,21 @@ function getReconnectController(userId, state, captureQr) {
     }
   });
   reconnectControllers.set(userId, controller);
+  reconnectContexts.set(userId, { state, captureQr, controller, expectedSocket: null });
   return controller;
 }
 
 async function attachSocket(userId, state, captureQr = false, suppliedController = null, expectedSocket = null) {
   if (expectedSocket && sessions.get(userId) !== expectedSocket) return null;
   const controller = suppliedController || getReconnectController(userId, state, captureQr);
-  reconnectContexts.set(userId, { state, captureQr });
+  const context = reconnectContexts.get(userId);
+  reconnectContexts.set(userId, {
+    ...context,
+    state,
+    captureQr,
+    controller,
+    expectedSocket: expectedSocket || context?.expectedSocket || null
+  });
   console.log('Fetching the latest WhatsApp Web version...');
   const { version } = await fetchLatestBaileysVersion();
   if (expectedSocket && sessions.get(userId) !== expectedSocket) return null;
@@ -224,6 +245,12 @@ async function attachSocket(userId, state, captureQr = false, suppliedController
   }
   sessions.set(userId, sock);
   sessionStatus.set(userId, 'connecting');
+  const activeContext = reconnectContexts.get(userId);
+  reconnectContexts.set(userId, {
+    ...activeContext,
+    controller,
+    expectedSocket: sock
+  });
 
   sock.ev.on('creds.update', async () => {
     try { await saveRecord(userId, 'creds', 'main', state.creds); }
@@ -270,16 +297,20 @@ async function attachSocket(userId, state, captureQr = false, suppliedController
       message: lastDisconnect?.error?.message,
       error: lastDisconnect?.error?.toString()
     });
-    // restartRequired reconnects immediately using this same encrypted auth state.
     if (!controller.schedule(statusCode, sock)) {
-      sessionStatus.set(userId, 'disconnected');
-      if (captureQr) qrStates.set(userId, { qr: null, status: 'disconnected', updatedAt: Date.now() });
-      if (sessions.get(userId) === sock) sessions.delete(userId);
-      controller.stop();
-      if (reconnectControllers.get(userId) === controller) {
-        reconnectControllers.delete(userId);
-        reconnectContexts.delete(userId);
-      }
+      // The exhaustion callback performs guarded in-memory cleanup. A terminal
+      // disconnect follows the same path; persisted Neon records are untouched.
+      cleanupExhaustedReconnect({
+        userId,
+        expectedSocket: sock,
+        controller,
+        sessions,
+        sessionStatus,
+        reconnectControllers,
+        reconnectContexts,
+        qrStates,
+        stopPresence: stopPresenceHeartbeat
+      });
     }
   });
   return sock;
@@ -343,9 +374,7 @@ export async function startUserQrSession(userId) {
 export async function startUserSession(userId, phoneNumber, onPairingCode) {
   return withPairingLock(pairingLocks, userId, async () => {
     if (!/^[a-f0-9-]{16,64}$/i.test(userId)) throw new Error('Invalid user ID.');
-    if (!/^\d{10,15}$/.test(phoneNumber)) {
-      throw new Error('Enter your country code and phone number using digits only.');
-    }
+    if (!/^\d{10,15}$/.test(phoneNumber)) throw new Error('Enter your country code and phone number using digits only.');
     if (sessions.has(userId)) throw new Error('A WhatsApp session is already active for this user.');
     const savedCreds = await readRecord(userId, 'creds', 'main');
     if (savedCreds?.registered) throw new Error('This WhatsApp account is already linked.');
@@ -356,18 +385,17 @@ export async function startUserSession(userId, phoneNumber, onPairingCode) {
     try {
       if (!sock) throw new Error('WhatsApp socket was superseded before pairing.');
       await waitForSocketReady(sock);
-      if (sessions.get(userId) !== sock || sessionStatus.get(userId) === 'disconnected') {
-        throw new Error('WhatsApp socket closed before pairing.');
-      }
+      if (sessions.get(userId) !== sock || sessionStatus.get(userId) === 'disconnected') throw new Error('WhatsApp socket closed before pairing.');
       const code = await sock.requestPairingCode(phoneNumber);
       if (typeof onPairingCode === 'function') onPairingCode(code);
       return { started: true };
     } catch (error) {
       stopPresenceHeartbeat(userId);
-      const controller = reconnectControllers.get(userId);
-      controller?.stop();
-      reconnectControllers.delete(userId);
-      reconnectContexts.delete(userId);
+      const activeController = reconnectControllers.get(userId);
+      activeController?.stop();
+      if (reconnectControllers.get(userId) === activeController) reconnectControllers.delete(userId);
+      const activeContext = reconnectContexts.get(userId);
+      if (activeContext?.controller === activeController) reconnectContexts.delete(userId);
       if (sessions.get(userId) === sock) sessions.delete(userId);
       sessionStatus.set(userId, 'disconnected');
       try { sock?.end(error); } catch { /* socket may already be closed */ }

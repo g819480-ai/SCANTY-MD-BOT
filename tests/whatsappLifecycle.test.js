@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import {
+  cleanupExhaustedReconnect,
   createReconnectController,
   reconnectDelay,
   reconnectIfCurrent,
@@ -40,6 +41,20 @@ function fakeTimers() {
   };
 }
 
+function cleanupMaps(socket = {}, controller = {}) {
+  const context = { controller, expectedSocket: socket, captureQr: true };
+  return {
+    socket,
+    controller,
+    sessions: new Map([['user', socket]]),
+    sessionStatus: new Map([['user', 'reconnecting']]),
+    reconnectControllers: new Map([['user', controller]]),
+    reconnectContexts: new Map([['user', context]]),
+    qrStates: new Map(),
+    context
+  };
+}
+
 test('restartRequired immediately reconnects; terminal reasons do not', () => {
   assert.equal(shouldReconnect(515, reasons), true);
   assert.equal(reconnectDelay(0, 515, reasons), 0);
@@ -59,21 +74,62 @@ test('consecutive reconnect failures retry to the configured maximum', async () 
     maxAttempts: 4,
     reasons
   });
-
-  assert.equal(controller.schedule(408, 'socket-A'), true);
+  controller.schedule(408, 'socket-A');
   const delays = [];
   while (timers.callbacks.size) delays.push(await timers.runNext());
   assert.equal(attempts, 4);
   assert.equal(controller.attempt, 4);
+  assert.equal(controller.exhausted, true);
   assert.deepEqual(delays, [1000, 2000, 4000, 8000]);
-  assert.equal(controller.schedule(408, 'socket-A'), false);
 });
 
-test('stop cancels scheduled reconnect and prevents further attempts', async () => {
+test('retry exhaustion cleans current in-memory socket/controller and permits a fresh pairing', async () => {
+  const timers = fakeTimers();
+  const maps = cleanupMaps();
+  let cleanupResult;
+  let stoppedPresence = 0;
+  const controller = createReconnectController({
+    reconnect: async () => { throw new Error('offline'); },
+    onExhausted: expectedSocket => {
+      cleanupResult = cleanupExhaustedReconnect({
+        userId: 'user',
+        expectedSocket,
+        controller,
+        ...maps,
+        stopPresence: () => { stoppedPresence += 1; }
+      });
+    },
+    setTimeoutFn: timers.setTimeoutFn,
+    clearTimeoutFn: timers.clearTimeoutFn,
+    maxAttempts: 1,
+    reasons
+  });
+  maps.reconnectControllers.set('user', controller);
+  maps.reconnectContexts.set('user', {
+    ...maps.context,
+    controller
+  });
+
+  controller.schedule(408, maps.socket);
+  await timers.runNext();
+  assert.equal(cleanupResult, true);
+  assert.equal(maps.sessionStatus.get('user'), 'disconnected');
+  assert.equal(maps.sessions.has('user'), false);
+  assert.equal(maps.reconnectControllers.has('user'), false);
+  assert.equal(maps.reconnectContexts.has('user'), false);
+  assert.equal(maps.qrStates.get('user').status, 'disconnected');
+  assert.equal(stoppedPresence, 1);
+  // Persistence is deliberately not part of this cleanup; pairing can begin again.
+  assert.equal(controller.stopped, true);
+});
+
+test('retry cancellation after stop prevents reconnect and exhaustion cleanup', async () => {
   const timers = fakeTimers();
   let attempts = 0;
+  let exhausted = 0;
   const controller = createReconnectController({
     reconnect: async () => { attempts += 1; },
+    onExhausted: () => { exhausted += 1; },
     setTimeoutFn: timers.setTimeoutFn,
     clearTimeoutFn: timers.clearTimeoutFn,
     reasons
@@ -83,9 +139,10 @@ test('stop cancels scheduled reconnect and prevents further attempts', async () 
   assert.equal(timers.callbacks.size, 0);
   assert.equal(await timers.runNext(), false);
   assert.equal(attempts, 0);
+  assert.equal(exhausted, 0);
 });
 
-test('scheduled reconnect retains socket identity and cannot replace a newer socket', async () => {
+test('scheduled reconnect cannot replace a newer socket', async () => {
   const timers = fakeTimers();
   const oldSocket = {};
   const newSocket = {};
@@ -101,11 +158,26 @@ test('scheduled reconnect retains socket identity and cannot replace a newer soc
     clearTimeoutFn: timers.clearTimeoutFn,
     reasons
   });
-
   controller.schedule(408, oldSocket);
   currentSocket = newSocket;
   await timers.runNext();
   assert.equal(reconnects, 0);
+});
+
+test('exhaustion cleanup leaves newer socket and replacement controller untouched', () => {
+  const maps = cleanupMaps();
+  const newerSocket = {};
+  const newerController = {};
+  maps.sessions.set('user', newerSocket);
+  maps.reconnectControllers.set('user', newerController);
+  assert.equal(cleanupExhaustedReconnect({
+    userId: 'user',
+    expectedSocket: maps.socket,
+    controller: maps.controller,
+    ...maps
+  }), false);
+  assert.equal(maps.sessions.get('user'), newerSocket);
+  assert.equal(maps.reconnectControllers.get('user'), newerController);
 });
 
 test('successful reconnection resets retry count', async () => {
@@ -123,22 +195,15 @@ test('successful reconnection resets retry count', async () => {
   controller.connected();
   assert.equal(controller.attempt, 0);
   controller.schedule(408, 'socket-B');
-  assert.equal((await timers.runNext()), 1000);
+  assert.equal(await timers.runNext(), 1000);
   assert.equal(attempts, 2);
 });
 
 test('pairing lock rejects concurrent pairing and releases after completion', async () => {
   const locks = new Set();
   let release;
-  const inFlight = withPairingLock(
-    locks,
-    'user',
-    () => new Promise(resolve => { release = resolve; })
-  );
-  await assert.rejects(
-    withPairingLock(locks, 'user', async () => {}),
-    { code: 'PAIRING_IN_PROGRESS' }
-  );
+  const inFlight = withPairingLock(locks, 'user', () => new Promise(resolve => { release = resolve; }));
+  await assert.rejects(withPairingLock(locks, 'user', async () => {}), { code: 'PAIRING_IN_PROGRESS' });
   release('done');
   assert.equal(await inFlight, 'done');
   assert.equal(locks.has('user'), false);

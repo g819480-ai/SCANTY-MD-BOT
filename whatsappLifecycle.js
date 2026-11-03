@@ -17,9 +17,51 @@ export function reconnectDelay(attempt, statusCode, reasons) {
   return Math.min(1000 * (2 ** boundedAttempt), 30000);
 }
 
+/**
+ * Removes only reconnect state owned by the exhausted socket/controller pair.
+ * This function is deliberately memory-only: it never touches persisted auth.
+ */
+export function cleanupExhaustedReconnect({
+  userId,
+  expectedSocket,
+  controller,
+  sessions,
+  sessionStatus,
+  reconnectControllers,
+  reconnectContexts,
+  qrStates,
+  stopPresence = () => {}
+}) {
+  const context = reconnectContexts.get(userId);
+  if (
+    sessions.get(userId) !== expectedSocket ||
+    reconnectControllers.get(userId) !== controller ||
+    context?.controller !== controller ||
+    context.expectedSocket !== expectedSocket
+  ) {
+    return false;
+  }
+
+  controller.stop();
+  stopPresence(userId);
+  sessionStatus.set(userId, 'disconnected');
+  sessions.delete(userId);
+  if (context.captureQr) {
+    qrStates.set(userId, {
+      qr: null,
+      status: 'disconnected',
+      updatedAt: Date.now()
+    });
+  }
+  reconnectControllers.delete(userId);
+  reconnectContexts.delete(userId);
+  return true;
+}
+
 export function createReconnectController({
   reconnect,
   onState = () => {},
+  onExhausted = () => {},
   setTimeoutFn = setTimeout,
   clearTimeoutFn = clearTimeout,
   maxAttempts = 10,
@@ -28,25 +70,34 @@ export function createReconnectController({
   let attempt = 0;
   let timer;
   let stopped = false;
+  let exhausted = false;
+
+  const finishExhausted = socketIdentity => {
+    if (stopped || exhausted) return;
+    exhausted = true;
+    onState('disconnected', socketIdentity);
+    onExhausted(socketIdentity);
+  };
 
   const queueAttempt = (statusCode, socketIdentity) => {
-    if (stopped || attempt >= maxAttempts) {
-      onState('disconnected');
+    if (stopped) return false;
+    if (attempt >= maxAttempts) {
+      finishExhausted(socketIdentity);
       return false;
     }
     if (timer) return true;
 
     const attemptNumber = attempt++;
     const wait = reconnectDelay(attemptNumber, statusCode, reasons);
-    onState('reconnecting');
+    onState('reconnecting', socketIdentity);
     timer = setTimeoutFn(async () => {
       timer = undefined;
       if (stopped) return;
       try {
-        // Identity is captured at scheduling time and passed through every retry.
         await reconnect(socketIdentity);
       } catch (error) {
-        onState('reconnect_failed', error);
+        onState('reconnect_failed', error, socketIdentity);
+        // Every failed attempt continues through the same bounded backoff loop.
         queueAttempt(undefined, socketIdentity);
       }
     }, wait);
@@ -55,14 +106,16 @@ export function createReconnectController({
 
   return {
     schedule(statusCode, socketIdentity) {
-      if (stopped || !shouldReconnect(statusCode, reasons)) {
-        onState('disconnected');
+      if (stopped) return false;
+      if (!shouldReconnect(statusCode, reasons)) {
+        finishExhausted(socketIdentity);
         return false;
       }
       return queueAttempt(statusCode, socketIdentity);
     },
     connected() {
       attempt = 0;
+      exhausted = false;
       if (timer) clearTimeoutFn(timer);
       timer = undefined;
       onState('connected');
@@ -73,7 +126,8 @@ export function createReconnectController({
       timer = undefined;
     },
     get attempt() { return attempt; },
-    get stopped() { return stopped; }
+    get stopped() { return stopped; },
+    get exhausted() { return exhausted; }
   };
 }
 
@@ -97,9 +151,7 @@ export async function withPairingLock(locks, userId, action) {
   }
 }
 
-/** Wait for the WebSocket transport to open. Baileys pairing must be requested
- * after transport readiness and before WhatsApp authentication completes.
- */
+/** Wait for the WebSocket transport to open before requesting a pairing code. */
 export function waitForSocketReady(sock, timeoutMs = 20000) {
   const ws = sock?.ws;
   if (!ws) return Promise.reject(new Error('WhatsApp WebSocket is unavailable.'));
