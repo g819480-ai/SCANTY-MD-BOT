@@ -59,31 +59,23 @@ function send(res, status, data) {
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff'
   });
-
   res.end(JSON.stringify(data));
 }
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
-
     req.on('data', chunk => {
       body += chunk;
-
       if (body.length > 10000) {
         reject(new Error('Request body too large'));
         req.destroy();
       }
     });
-
     req.on('end', () => {
-      try {
-        resolve(JSON.parse(body || '{}'));
-      } catch {
-        reject(new Error('Invalid JSON'));
-      }
+      try { resolve(JSON.parse(body || '{}')); }
+      catch { reject(new Error('Invalid JSON')); }
     });
-
     req.on('error', reject);
   });
 }
@@ -98,37 +90,23 @@ function createToken(user, isGuest = false) {
 
 function getToken(req) {
   const header = req.headers.authorization || '';
-
-  if (!header.startsWith('Bearer ')) {
-    return null;
-  }
-
-  return header.slice(7);
+  return header.startsWith('Bearer ') ? header.slice(7) : null;
 }
 
 async function authenticatedUser(req) {
   const token = getToken(req);
-
-  if (!token) {
-    return null;
-  }
-
+  if (!token) return null;
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-
     const result = await pool.query(
       `SELECT id, email, role, is_guest, created_at
-       FROM users
-       WHERE id = $1`,
+       FROM users WHERE id = $1`,
       [decoded.userId]
     );
-
     const user = result.rows[0];
-
     if (!user) return null;
     if (decoded.guest && !user.is_guest) return null;
     if (!decoded.guest && user.is_guest) return null;
-
     return user;
   } catch {
     return null;
@@ -144,36 +122,22 @@ async function initializeDatabase() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
-
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user'`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_guest BOOLEAN NOT NULL DEFAULT FALSE`);
   await pool.query(`
-    ALTER TABLE users
-    ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user'
-  `);
-
-  await pool.query(`
-    ALTER TABLE users
-    ADD COLUMN IF NOT EXISTS is_guest BOOLEAN NOT NULL DEFAULT FALSE
-  `);
-
-  await pool.query(`
-    UPDATE users
-    SET role = 'user'
+    UPDATE users SET role = 'user'
     WHERE role IS NULL OR role NOT IN ('user', 'admin')
   `);
 
   const passwordHash = await bcrypt.hash(ADMIN_PASSWORD, 12);
-
   await pool.query(
     `INSERT INTO users (email, password_hash, role, is_guest)
      VALUES ($1, $2, 'admin', FALSE)
-     ON CONFLICT (email)
-     DO UPDATE SET
+     ON CONFLICT (email) DO UPDATE SET
        password_hash = EXCLUDED.password_hash,
-       role = 'admin',
-       is_guest = FALSE`,
+       role = 'admin', is_guest = FALSE`,
     [ADMIN_EMAIL, passwordHash]
   );
-
   console.log('Database initialized.');
 }
 
@@ -183,274 +147,140 @@ function rateLimit(req, res, limit = 20) {
   const key = `${req.socket.remoteAddress}:${req.url}`;
   const now = Date.now();
   const previous = rateLimits.get(key);
-
   if (!previous || now - previous.start > 60000) {
     rateLimits.set(key, { start: now, count: 1 });
     return false;
   }
-
   previous.count += 1;
-
   if (previous.count > limit) {
-    send(res, 429, {
-      error: 'Too many requests. Please try again later.'
-    });
-
+    send(res, 429, { error: 'Too many requests. Please try again later.' });
     return true;
   }
-
   return false;
 }
 
 async function handleRequest(req, res) {
   const origin = req.headers.origin;
-
-  // CORS diagnostics: log both values without exposing secrets.
   console.log('CORS CHECK:', {
     method: req.method,
     path: req.url,
     receivedOrigin: origin || '(no origin)',
     allowedOrigin: DASHBOARD_ORIGIN
   });
-
   if (origin === DASHBOARD_ORIGIN) {
     res.setHeader('Access-Control-Allow-Origin', DASHBOARD_ORIGIN);
     res.setHeader('Vary', 'Origin');
   }
-
-  res.setHeader(
-    'Access-Control-Allow-Methods',
-    'GET, POST, OPTIONS'
-  );
-
-  res.setHeader(
-    'Access-Control-Allow-Headers',
-    'Content-Type, Authorization'
-  );
-
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Access-Control-Max-Age', '600');
 
   if (req.method === 'OPTIONS') {
     if (origin && origin !== DASHBOARD_ORIGIN) {
-      console.error('CORS BLOCKED:', {
-        receivedOrigin: origin,
-        allowedOrigin: DASHBOARD_ORIGIN
-      });
-
-      return send(res, 403, {
-        error: 'Origin not allowed.'
-      });
+      return send(res, 403, { error: 'Origin not allowed.' });
     }
-
     res.writeHead(204);
     return res.end();
   }
-
   if (origin && origin !== DASHBOARD_ORIGIN) {
-    console.error('CORS BLOCKED:', {
-      receivedOrigin: origin,
-      allowedOrigin: DASHBOARD_ORIGIN
-    });
-
-    return send(res, 403, {
-      error: 'Origin not allowed.'
-    });
+    return send(res, 403, { error: 'Origin not allowed.' });
   }
 
-  const url = new URL(
-    req.url,
-    `http://${req.headers.host || 'localhost'}`
-  );
-
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   if (req.method === 'GET' && url.pathname === '/') {
-    return send(res, 200, {
-      success: true,
-      name: 'SCANTY MD BOT',
-      status: 'running'
-    });
+    return send(res, 200, { success: true, name: 'SCANTY MD BOT', status: 'running' });
   }
-
   if (req.method === 'GET' && url.pathname === '/health') {
-    return send(res, 200, {
-      status: 'online'
-    });
+    return send(res, 200, { status: 'online' });
   }
-
   if (req.method === 'GET' && url.pathname === '/db-health') {
     try {
       await pool.query('SELECT NOW()');
-
-      return send(res, 200, {
-        status: 'connected',
-        database: 'Neon PostgreSQL'
-      });
+      return send(res, 200, { status: 'connected', database: 'Neon PostgreSQL' });
     } catch (error) {
       console.error('Database health error:', error.message);
-
-      return send(res, 503, {
-        status: 'disconnected'
-      });
+      return send(res, 503, { status: 'disconnected' });
     }
   }
 
-  // Public visitor session.
-  if (
-    req.method === 'POST' &&
-    url.pathname === '/api/public/session'
-  ) {
+  if (req.method === 'POST' && url.pathname === '/api/public/session') {
     if (rateLimit(req, res, 5)) return;
-
     try {
       const guestId = crypto.randomUUID();
       const guestEmail = `guest-${guestId}@guest.scanty.invalid`;
       const randomPassword = crypto.randomBytes(48).toString('hex');
       const passwordHash = await bcrypt.hash(randomPassword, 10);
-
       const result = await pool.query(
-        `INSERT INTO users
-          (id, email, password_hash, role, is_guest)
-         VALUES ($1, $2, $3, 'user', TRUE)
-         RETURNING id`,
+        `INSERT INTO users (id, email, password_hash, role, is_guest)
+         VALUES ($1, $2, $3, 'user', TRUE) RETURNING id`,
         [guestId, guestEmail, passwordHash]
       );
-
-      const guest = result.rows[0];
-
       return send(res, 201, {
         success: true,
-        token: createToken(guest, true),
+        token: createToken(result.rows[0], true),
         message: 'Private pairing session created.'
       });
     } catch (error) {
-      console.error(
-        'Guest session creation failed:',
-        error.message
-      );
-
-      return send(res, 500, {
-        error: 'Could not create a pairing session. Please try again.'
-      });
+      console.error('Guest session creation failed:', error.message);
+      return send(res, 500, { error: 'Could not create a pairing session. Please try again.' });
     }
   }
 
-  // Public registration is disabled.
-  if (
-    req.method === 'POST' &&
-    url.pathname === '/api/auth/register'
-  ) {
-    return send(res, 403, {
-      error: 'Public registration is disabled.'
-    });
+  if (req.method === 'POST' && url.pathname === '/api/auth/register') {
+    return send(res, 403, { error: 'Public registration is disabled.' });
   }
 
-  // Administrator login.
-  if (
-    req.method === 'POST' &&
-    url.pathname === '/api/auth/login'
-  ) {
+  if (req.method === 'POST' && url.pathname === '/api/auth/login') {
     if (rateLimit(req, res, 5)) return;
-
     let body;
-
-    try {
-      body = await readBody(req);
-    } catch {
-      return send(res, 400, {
-        error: 'Invalid request body.'
-      });
-    }
-
+    try { body = await readBody(req); }
+    catch { return send(res, 400, { error: 'Invalid request body.' }); }
     const email = String(body.email || '').trim().toLowerCase();
     const password = body.password;
-
-    if (
-      email !== ADMIN_EMAIL ||
-      typeof password !== 'string' ||
-      password.length < 1 ||
-      Buffer.byteLength(password, 'utf8') > 72
-    ) {
-      return send(res, 401, {
-        error: 'Incorrect administrator email or password.'
-      });
+    if (email !== ADMIN_EMAIL || typeof password !== 'string' || password.length < 1 || Buffer.byteLength(password, 'utf8') > 72) {
+      return send(res, 401, { error: 'Incorrect administrator email or password.' });
     }
-
     try {
       const result = await pool.query(
-        `SELECT id, email, password_hash, role
-         FROM users
+        `SELECT id, email, password_hash, role FROM users
          WHERE email = $1 AND is_guest = FALSE`,
         [ADMIN_EMAIL]
       );
-
       const user = result.rows[0];
-
-      if (
-        !user ||
-        user.role !== 'admin' ||
-        !(await bcrypt.compare(password, user.password_hash))
-      ) {
-        return send(res, 401, {
-          error: 'Incorrect administrator email or password.'
-        });
+      if (!user || user.role !== 'admin' || !(await bcrypt.compare(password, user.password_hash))) {
+        return send(res, 401, { error: 'Incorrect administrator email or password.' });
       }
-
       return send(res, 200, {
         success: true,
         message: 'Administrator login successful.',
-        user: {
-          id: user.id,
-          email: user.email,
-          role: user.role
-        },
+        user: { id: user.id, email: user.email, role: user.role },
         token: createToken(user)
       });
     } catch (error) {
       console.error('Admin login error:', error.message);
-
-      return send(res, 500, {
-        error: 'Administrator login could not be completed.'
-      });
+      return send(res, 500, { error: 'Administrator login could not be completed.' });
     }
   }
 
-  // Check administrator login.
   if (req.method === 'GET' && url.pathname === '/api/auth/me') {
     const user = await authenticatedUser(req);
-
     if (!user || user.is_guest || user.role !== 'admin') {
-      return send(res, 401, {
-        error: 'Administrator login required.'
-      });
+      return send(res, 401, { error: 'Administrator login required.' });
     }
-
     return send(res, 200, {
       success: true,
-      user: {
-        id: user.id,
-        email: user.email,
-        role: user.role
-      }
+      user: { id: user.id, email: user.email, role: user.role }
     });
   }
 
-  // Start QR pairing.
-  if (
-    req.method === 'POST' &&
-    url.pathname === '/api/whatsapp/qr'
-  ) {
-    
-
+  if (req.method === 'POST' && url.pathname === '/api/whatsapp/qr') {
+    if (rateLimit(req, res, 5)) return;
     const user = await authenticatedUser(req);
-
     if (!user) {
-      return send(res, 401, {
-        error: 'Create a pairing session before connecting WhatsApp.'
-      });
+      return send(res, 401, { error: 'Create a pairing session before connecting WhatsApp.' });
     }
-
     try {
       await startUserQrSession(user.id);
-
       return send(res, 202, {
         success: true,
         message: 'QR pairing started. Waiting for WhatsApp QR code.',
@@ -458,85 +288,36 @@ async function handleRequest(req, res) {
       });
     } catch (error) {
       console.error('WhatsApp QR start error:', error.message);
-
-      return send(res, 400, {
-        error: error.message || 'Could not start QR pairing.'
-      });
+      return send(res, 400, { error: error.message || 'Could not start QR pairing.' });
     }
   }
 
-  // Check QR pairing state.
-  if (
-    req.method === 'GET' &&
-    url.pathname === '/api/whatsapp/qr'
-  ) {
+  if (req.method === 'GET' && url.pathname === '/api/whatsapp/qr') {
     if (rateLimit(req, res, 60)) return;
-
     const user = await authenticatedUser(req);
-
     if (!user) {
-      return send(res, 401, {
-        error: 'Create a pairing session before checking WhatsApp pairing.'
-      });
+      return send(res, 401, { error: 'Create a pairing session before checking WhatsApp pairing.' });
     }
-
-    return send(res, 200, {
-      success: true,
-      ...getUserQrState(user.id)
-    });
+    return send(res, 200, { success: true, ...getUserQrState(user.id) });
   }
 
-  // Phone-number pairing.
-  if (
-    req.method === 'POST' &&
-    url.pathname === '/api/whatsapp/pair'
-  ) {
+  if (req.method === 'POST' && url.pathname === '/api/whatsapp/pair') {
     if (rateLimit(req, res, 5)) return;
-
     const user = await authenticatedUser(req);
-
     if (!user) {
-      return send(res, 401, {
-        error: 'Create a pairing session before connecting WhatsApp.'
-      });
+      return send(res, 401, { error: 'Create a pairing session before connecting WhatsApp.' });
     }
-
     let body;
-
-    try {
-      body = await readBody(req);
-    } catch {
-      return send(res, 400, {
-        error: 'Invalid request body.'
-      });
-    }
-
-    const phoneNumber = String(body.phoneNumber || '')
-      .replace(/[\s+()-]/g, '');
-
+    try { body = await readBody(req); }
+    catch { return send(res, 400, { error: 'Invalid request body.' }); }
+    const phoneNumber = String(body.phoneNumber || '').replace(/[\s+()-]/g, '');
     if (!/^\d{10,15}$/.test(phoneNumber)) {
-      return send(res, 400, {
-        error: 'Enter your phone number with country code, using digits only.'
-      });
+      return send(res, 400, { error: 'Enter your phone number with country code, using digits only.' });
     }
-
     try {
       let pairingCode = null;
-
-      await startUserSession(
-        user.id,
-        phoneNumber,
-        code => {
-          pairingCode = code;
-        }
-      );
-
-      if (!pairingCode) {
-        return send(res, 500, {
-          error: 'The pairing code could not be generated.'
-        });
-      }
-
+      await startUserSession(user.id, phoneNumber, code => { pairingCode = code; });
+      if (!pairingCode) return send(res, 500, { error: 'The pairing code could not be generated.' });
       return send(res, 200, {
         success: true,
         message: 'Pairing code generated. Enter it in WhatsApp Linked Devices.',
@@ -544,78 +325,38 @@ async function handleRequest(req, res) {
       });
     } catch (error) {
       console.error('WhatsApp pairing error:', error.message);
-
-      return send(res, 400, {
-        error: error.message || 'Could not start WhatsApp pairing.'
-      });
+      return send(res, 400, { error: error.message || 'Could not start WhatsApp pairing.' });
     }
   }
 
-  // Administrator-only dashboard data.
-  if (
-    req.method === 'GET' &&
-    (
-      url.pathname === '/api/admin/stats' ||
-      url.pathname === '/api/admin/users'
-    )
-  ) {
+  if (req.method === 'GET' && (url.pathname === '/api/admin/stats' || url.pathname === '/api/admin/users')) {
     const user = await authenticatedUser(req);
-
     if (!user || user.is_guest || user.role !== 'admin') {
-      return send(res, 403, {
-        error: 'Administrator access required.'
-      });
+      return send(res, 403, { error: 'Administrator access required.' });
     }
-
     try {
       if (url.pathname === '/api/admin/stats') {
         const result = await pool.query(`
           SELECT
-            COUNT(*) FILTER (
-              WHERE is_guest = FALSE
-            )::int AS total_users,
-
-            COUNT(*) FILTER (
-              WHERE role = 'admin' AND is_guest = FALSE
-            )::int AS total_admins,
-
-            COUNT(*) FILTER (
-              WHERE role = 'user' AND is_guest = FALSE
-            )::int AS total_members
-
+            COUNT(*) FILTER (WHERE is_guest = FALSE)::int AS total_users,
+            COUNT(*) FILTER (WHERE role = 'admin' AND is_guest = FALSE)::int AS total_admins,
+            COUNT(*) FILTER (WHERE role = 'user' AND is_guest = FALSE)::int AS total_members
           FROM users
         `);
-
-        return send(res, 200, {
-          success: true,
-          stats: result.rows[0]
-        });
+        return send(res, 200, { success: true, stats: result.rows[0] });
       }
-
       const result = await pool.query(`
-        SELECT id, email, role, created_at
-        FROM users
-        WHERE is_guest = FALSE
-        ORDER BY created_at DESC
-        LIMIT 100
+        SELECT id, email, role, created_at FROM users
+        WHERE is_guest = FALSE ORDER BY created_at DESC LIMIT 100
       `);
-
-      return send(res, 200, {
-        success: true,
-        users: result.rows
-      });
+      return send(res, 200, { success: true, users: result.rows });
     } catch (error) {
       console.error('Admin request error:', error.message);
-
-      return send(res, 500, {
-        error: 'Could not load admin data.'
-      });
+      return send(res, 500, { error: 'Could not load admin data.' });
     }
   }
 
-  return send(res, 404, {
-    error: 'Route not found.'
-  });
+  return send(res, 404, { error: 'Route not found.' });
 }
 
 async function startServer() {
@@ -627,17 +368,10 @@ async function startServer() {
   const server = http.createServer((req, res) => {
     handleRequest(req, res).catch(error => {
       console.error('Request error:', error.message);
-
-      if (!res.headersSent) {
-        send(res, 500, {
-          error: 'Internal server error.'
-        });
-      } else {
-        res.end();
-      }
+      if (!res.headersSent) send(res, 500, { error: 'Internal server error.' });
+      else res.end();
     });
   });
-
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`SCANTY MD BOT running on port ${PORT}`);
     console.log('Allowed dashboard origin:', DASHBOARD_ORIGIN);
