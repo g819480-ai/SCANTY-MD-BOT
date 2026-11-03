@@ -1,10 +1,10 @@
-
 import makeWASocket, {
   initAuthCreds,
   BufferJSON,
   proto,
   Browsers,
-  fetchLatestBaileysVersion
+  fetchLatestBaileysVersion,
+  DisconnectReason
 } from '@whiskeysockets/baileys';
 
 import pino from 'pino';
@@ -293,7 +293,23 @@ async function attachSocket(userId, state, captureQr = false) {
     version,
     markOnlineOnConnect: false,
     syncFullHistory: false,
-    generateHighQualityLinkPreview: false
+    generateHighQualityLinkPreview: false,
+    keepAliveIntervalMs: 30000,
+    connectTimeoutMs: 30000,
+    shouldReconnect: (retryCount, cause) => {
+      const statusCode = cause?.output?.statusCode;
+
+      if (
+        statusCode === DisconnectReason.loggedOut ||
+        statusCode === DisconnectReason.connectionReplaced ||
+        statusCode === DisconnectReason.badSession ||
+        statusCode === DisconnectReason.restartRequired
+      ) {
+        return false;
+      }
+
+      return retryCount < 10;
+    }
   });
 
   sessions.set(userId, sock);
@@ -334,6 +350,13 @@ async function attachSocket(userId, state, captureQr = false) {
     async ({ connection, lastDisconnect, qr }) => {
       if (sessions.get(userId) !== sock) return;
 
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const isTerminalDisconnect =
+        statusCode === DisconnectReason.loggedOut ||
+        statusCode === DisconnectReason.connectionReplaced ||
+        statusCode === DisconnectReason.badSession ||
+        statusCode === DisconnectReason.restartRequired;
+
       if (captureQr && qr) {
         qrStates.set(userId, {
           qr,
@@ -360,6 +383,7 @@ async function attachSocket(userId, state, captureQr = false) {
         await sendScantyWelcome(userId, sock);
 
         startPresenceHeartbeat(userId, sock);
+        return;
       }
 
       if (connection === 'connecting') {
@@ -376,28 +400,34 @@ async function attachSocket(userId, state, captureQr = false) {
             });
           }
         }
+
+        return;
       }
 
       if (connection === 'close') {
-        sessionStatus.set(userId, 'disconnected');
-
-        if (captureQr) {
-          qrStates.set(userId, {
-            qr: null,
-            status: 'disconnected',
-            updatedAt: Date.now()
-          });
-        }
-
         stopPresenceHeartbeat(userId);
 
-        if (sessions.get(userId) === sock) {
-          sessions.delete(userId);
+        if (isTerminalDisconnect) {
+          sessionStatus.set(userId, 'disconnected');
+
+          if (captureQr) {
+            qrStates.set(userId, {
+              qr: null,
+              status: 'disconnected',
+              updatedAt: Date.now()
+            });
+          }
+
+          if (sessions.get(userId) === sock) {
+            sessions.delete(userId);
+          }
+        } else {
+          sessionStatus.set(userId, 'reconnecting');
         }
 
         console.error('WHATSAPP DISCONNECT DETAILS:', {
           userId,
-          statusCode: lastDisconnect?.error?.output?.statusCode,
+          statusCode,
           message: lastDisconnect?.error?.message,
           error: lastDisconnect?.error?.toString()
         });
