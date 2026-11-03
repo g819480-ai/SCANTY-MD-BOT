@@ -33,10 +33,14 @@ export function cleanupExhaustedReconnect({
   stopPresence = () => {}
 }) {
   const context = reconnectContexts.get(userId);
+  // Fail closed unless all three ownership invariants still match. In
+  // particular, a missing context cannot establish that this controller owns
+  // the current socket, so it must not authorize cleanup.
   if (
     sessions.get(userId) !== expectedSocket ||
     reconnectControllers.get(userId) !== controller ||
-    context?.controller !== controller ||
+    !context ||
+    context.controller !== controller ||
     context.expectedSocket !== expectedSocket
   ) {
     return false;

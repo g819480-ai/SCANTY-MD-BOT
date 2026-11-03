@@ -55,6 +55,15 @@ function cleanupMaps(socket = {}, controller = {}) {
   };
 }
 
+function cleanup(maps, expectedSocket = maps.socket, controller = maps.controller) {
+  return cleanupExhaustedReconnect({
+    userId: 'user',
+    expectedSocket,
+    controller,
+    ...maps
+  });
+}
+
 test('restartRequired immediately reconnects; terminal reasons do not', () => {
   assert.equal(shouldReconnect(515, reasons), true);
   assert.equal(reconnectDelay(0, 515, reasons), 0);
@@ -83,12 +92,66 @@ test('consecutive reconnect failures retry to the configured maximum', async () 
   assert.deepEqual(delays, [1000, 2000, 4000, 8000]);
 });
 
+test('cleanup safely rejects a missing reconnect context without changing session state', () => {
+  const maps = cleanupMaps();
+  maps.reconnectContexts.delete('user');
+
+  assert.doesNotThrow(() => assert.equal(cleanup(maps), false));
+  assert.equal(maps.sessions.get('user'), maps.socket);
+  assert.equal(maps.sessionStatus.get('user'), 'reconnecting');
+  assert.equal(maps.reconnectControllers.get('user'), maps.controller);
+  assert.equal(maps.controller.stopped, false);
+});
+
+test('cleanup rejects a socket replaced by a newer active session and never deletes it', () => {
+  const maps = cleanupMaps();
+  const newerSocket = {};
+  maps.sessions.set('user', newerSocket);
+
+  assert.equal(cleanup(maps), false);
+  assert.equal(maps.sessions.get('user'), newerSocket);
+  assert.equal(maps.sessionStatus.get('user'), 'reconnecting');
+  assert.equal(maps.reconnectControllers.get('user'), maps.controller);
+});
+
+test('cleanup rejects a controller replaced by a newer controller', () => {
+  const maps = cleanupMaps();
+  const newerController = {};
+  maps.reconnectControllers.set('user', newerController);
+
+  assert.equal(cleanup(maps), false);
+  assert.equal(maps.sessions.get('user'), maps.socket);
+  assert.equal(maps.reconnectControllers.get('user'), newerController);
+  assert.equal(maps.sessionStatus.get('user'), 'reconnecting');
+});
+
+test('cleanup succeeds only for the current session, socket, and controller', () => {
+  const maps = cleanupMaps();
+  let stoppedPresence = 0;
+
+  assert.equal(cleanupExhaustedReconnect({
+    userId: 'user',
+    expectedSocket: maps.socket,
+    controller: maps.controller,
+    ...maps,
+    stopPresence: () => { stoppedPresence += 1; }
+  }), true);
+  assert.equal(maps.sessions.has('user'), false);
+  assert.equal(maps.sessionStatus.get('user'), 'disconnected');
+  assert.equal(maps.reconnectControllers.has('user'), false);
+  assert.equal(maps.reconnectContexts.has('user'), false);
+  assert.deepEqual(maps.qrStates.get('user').status, 'disconnected');
+  assert.equal(stoppedPresence, 1);
+  assert.equal(maps.controller.stopped, true);
+});
+
 test('retry exhaustion cleans current in-memory socket/controller and permits a fresh pairing', async () => {
   const timers = fakeTimers();
   const maps = cleanupMaps();
   let cleanupResult;
   let stoppedPresence = 0;
-  const controller = createReconnectController({
+  let controller;
+  controller = createReconnectController({
     reconnect: async () => { throw new Error('offline'); },
     onExhausted: expectedSocket => {
       cleanupResult = cleanupExhaustedReconnect({
@@ -162,22 +225,6 @@ test('scheduled reconnect cannot replace a newer socket', async () => {
   currentSocket = newSocket;
   await timers.runNext();
   assert.equal(reconnects, 0);
-});
-
-test('exhaustion cleanup leaves newer socket and replacement controller untouched', () => {
-  const maps = cleanupMaps();
-  const newerSocket = {};
-  const newerController = {};
-  maps.sessions.set('user', newerSocket);
-  maps.reconnectControllers.set('user', newerController);
-  assert.equal(cleanupExhaustedReconnect({
-    userId: 'user',
-    expectedSocket: maps.socket,
-    controller: maps.controller,
-    ...maps
-  }), false);
-  assert.equal(maps.sessions.get('user'), newerSocket);
-  assert.equal(maps.reconnectControllers.get('user'), newerController);
 });
 
 test('successful reconnection resets retry count', async () => {
