@@ -24,12 +24,15 @@ const JWT_SECRET = process.env.JWT_SECRET;
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL?.trim().toLowerCase();
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 
-const DASHBOARD_ORIGIN =
+const DASHBOARD_ORIGIN = (
   process.env.DASHBOARD_ORIGIN ||
-  'https://scanty-md-dashboard.g819480.workers.dev';
+  'https://scanty-md-dashboard.g819480.workers.dev'
+).trim().replace(/\/+$/, '');
 
 if (!DATABASE_URL || !JWT_SECRET || JWT_SECRET.length < 32) {
-  throw new Error('DATABASE_URL and a JWT_SECRET of at least 32 characters are required.');
+  throw new Error(
+    'DATABASE_URL and a JWT_SECRET of at least 32 characters are required.'
+  );
 }
 
 if (
@@ -38,7 +41,9 @@ if (
   Buffer.byteLength(ADMIN_PASSWORD, 'utf8') > 72 ||
   ADMIN_PASSWORD.length < 12
 ) {
-  throw new Error('Set ADMIN_EMAIL and an ADMIN_PASSWORD of at least 12 characters.');
+  throw new Error(
+    'Set ADMIN_EMAIL and an ADMIN_PASSWORD of at least 12 characters.'
+  );
 }
 
 const pool = new Pool({
@@ -54,6 +59,7 @@ function send(res, status, data) {
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff'
   });
+
   res.end(JSON.stringify(data));
 }
 
@@ -63,6 +69,7 @@ function readBody(req) {
 
     req.on('data', chunk => {
       body += chunk;
+
       if (body.length > 10000) {
         reject(new Error('Request body too large'));
         req.destroy();
@@ -91,13 +98,20 @@ function createToken(user, isGuest = false) {
 
 function getToken(req) {
   const header = req.headers.authorization || '';
-  if (!header.startsWith('Bearer ')) return null;
+
+  if (!header.startsWith('Bearer ')) {
+    return null;
+  }
+
   return header.slice(7);
 }
 
 async function authenticatedUser(req) {
   const token = getToken(req);
-  if (!token) return null;
+
+  if (!token) {
+    return null;
+  }
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
@@ -110,8 +124,8 @@ async function authenticatedUser(req) {
     );
 
     const user = result.rows[0];
-    if (!user) return null;
 
+    if (!user) return null;
     if (decoded.guest && !user.is_guest) return null;
     if (!decoded.guest && user.is_guest) return null;
 
@@ -181,6 +195,7 @@ function rateLimit(req, res, limit = 20) {
     send(res, 429, {
       error: 'Too many requests. Please try again later.'
     });
+
     return true;
   }
 
@@ -190,24 +205,56 @@ function rateLimit(req, res, limit = 20) {
 async function handleRequest(req, res) {
   const origin = req.headers.origin;
 
+  // CORS diagnostics: log both values without exposing secrets.
+  console.log('CORS CHECK:', {
+    method: req.method,
+    path: req.url,
+    receivedOrigin: origin || '(no origin)',
+    allowedOrigin: DASHBOARD_ORIGIN
+  });
+
   if (origin === DASHBOARD_ORIGIN) {
     res.setHeader('Access-Control-Allow-Origin', DASHBOARD_ORIGIN);
     res.setHeader('Vary', 'Origin');
   }
 
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader(
+    'Access-Control-Allow-Methods',
+    'GET, POST, OPTIONS'
+  );
+
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'Content-Type, Authorization'
+  );
+
+  res.setHeader('Access-Control-Max-Age', '600');
 
   if (req.method === 'OPTIONS') {
     if (origin && origin !== DASHBOARD_ORIGIN) {
-      return send(res, 403, { error: 'Origin not allowed.' });
+      console.error('CORS BLOCKED:', {
+        receivedOrigin: origin,
+        allowedOrigin: DASHBOARD_ORIGIN
+      });
+
+      return send(res, 403, {
+        error: 'Origin not allowed.'
+      });
     }
+
     res.writeHead(204);
     return res.end();
   }
 
   if (origin && origin !== DASHBOARD_ORIGIN) {
-    return send(res, 403, { error: 'Origin not allowed.' });
+    console.error('CORS BLOCKED:', {
+      receivedOrigin: origin,
+      allowedOrigin: DASHBOARD_ORIGIN
+    });
+
+    return send(res, 403, {
+      error: 'Origin not allowed.'
+    });
   }
 
   const url = new URL(
@@ -224,23 +271,29 @@ async function handleRequest(req, res) {
   }
 
   if (req.method === 'GET' && url.pathname === '/health') {
-    return send(res, 200, { status: 'online' });
+    return send(res, 200, {
+      status: 'online'
+    });
   }
 
   if (req.method === 'GET' && url.pathname === '/db-health') {
     try {
       await pool.query('SELECT NOW()');
+
       return send(res, 200, {
         status: 'connected',
         database: 'Neon PostgreSQL'
       });
     } catch (error) {
       console.error('Database health error:', error.message);
-      return send(res, 503, { status: 'disconnected' });
+
+      return send(res, 503, {
+        status: 'disconnected'
+      });
     }
   }
 
-  // Public visitor session. No account or password is required.
+  // Public visitor session.
   if (
     req.method === 'POST' &&
     url.pathname === '/api/public/session'
@@ -269,14 +322,18 @@ async function handleRequest(req, res) {
         message: 'Private pairing session created.'
       });
     } catch (error) {
-      console.error('Guest session creation failed:', error.message);
+      console.error(
+        'Guest session creation failed:',
+        error.message
+      );
+
       return send(res, 500, {
         error: 'Could not create a pairing session. Please try again.'
       });
     }
   }
 
-  // Public registration is disabled. Only the administrator can log in.
+  // Public registration is disabled.
   if (
     req.method === 'POST' &&
     url.pathname === '/api/auth/register'
@@ -286,6 +343,7 @@ async function handleRequest(req, res) {
     });
   }
 
+  // Administrator login.
   if (
     req.method === 'POST' &&
     url.pathname === '/api/auth/login'
@@ -293,10 +351,13 @@ async function handleRequest(req, res) {
     if (rateLimit(req, res, 5)) return;
 
     let body;
+
     try {
       body = await readBody(req);
     } catch {
-      return send(res, 400, { error: 'Invalid request body.' });
+      return send(res, 400, {
+        error: 'Invalid request body.'
+      });
     }
 
     const email = String(body.email || '').trim().toLowerCase();
@@ -345,12 +406,14 @@ async function handleRequest(req, res) {
       });
     } catch (error) {
       console.error('Admin login error:', error.message);
+
       return send(res, 500, {
         error: 'Administrator login could not be completed.'
       });
     }
   }
 
+  // Check administrator login.
   if (req.method === 'GET' && url.pathname === '/api/auth/me') {
     const user = await authenticatedUser(req);
 
@@ -370,7 +433,7 @@ async function handleRequest(req, res) {
     });
   }
 
-  // QR pairing: each visitor token maps to a different guest UUID.
+  // Start QR pairing.
   if (
     req.method === 'POST' &&
     url.pathname === '/api/whatsapp/qr'
@@ -378,6 +441,7 @@ async function handleRequest(req, res) {
     if (rateLimit(req, res, 5)) return;
 
     const user = await authenticatedUser(req);
+
     if (!user) {
       return send(res, 401, {
         error: 'Create a pairing session before connecting WhatsApp.'
@@ -394,12 +458,14 @@ async function handleRequest(req, res) {
       });
     } catch (error) {
       console.error('WhatsApp QR start error:', error.message);
+
       return send(res, 400, {
         error: error.message || 'Could not start QR pairing.'
       });
     }
   }
 
+  // Check QR pairing state.
   if (
     req.method === 'GET' &&
     url.pathname === '/api/whatsapp/qr'
@@ -407,6 +473,7 @@ async function handleRequest(req, res) {
     if (rateLimit(req, res, 60)) return;
 
     const user = await authenticatedUser(req);
+
     if (!user) {
       return send(res, 401, {
         error: 'Create a pairing session before checking WhatsApp pairing.'
@@ -427,6 +494,7 @@ async function handleRequest(req, res) {
     if (rateLimit(req, res, 5)) return;
 
     const user = await authenticatedUser(req);
+
     if (!user) {
       return send(res, 401, {
         error: 'Create a pairing session before connecting WhatsApp.'
@@ -434,10 +502,13 @@ async function handleRequest(req, res) {
     }
 
     let body;
+
     try {
       body = await readBody(req);
     } catch {
-      return send(res, 400, { error: 'Invalid request body.' });
+      return send(res, 400, {
+        error: 'Invalid request body.'
+      });
     }
 
     const phoneNumber = String(body.phoneNumber || '')
@@ -473,13 +544,14 @@ async function handleRequest(req, res) {
       });
     } catch (error) {
       console.error('WhatsApp pairing error:', error.message);
+
       return send(res, 400, {
         error: error.message || 'Could not start WhatsApp pairing.'
       });
     }
   }
 
-  // Admin-only dashboard data.
+  // Administrator-only dashboard data.
   if (
     req.method === 'GET' &&
     (
@@ -499,13 +571,18 @@ async function handleRequest(req, res) {
       if (url.pathname === '/api/admin/stats') {
         const result = await pool.query(`
           SELECT
-            COUNT(*) FILTER (WHERE is_guest = FALSE)::int AS total_users,
+            COUNT(*) FILTER (
+              WHERE is_guest = FALSE
+            )::int AS total_users,
+
             COUNT(*) FILTER (
               WHERE role = 'admin' AND is_guest = FALSE
             )::int AS total_admins,
+
             COUNT(*) FILTER (
               WHERE role = 'user' AND is_guest = FALSE
             )::int AS total_members
+
           FROM users
         `);
 
@@ -529,13 +606,16 @@ async function handleRequest(req, res) {
       });
     } catch (error) {
       console.error('Admin request error:', error.message);
+
       return send(res, 500, {
         error: 'Could not load admin data.'
       });
     }
   }
 
-  return send(res, 404, { error: 'Route not found.' });
+  return send(res, 404, {
+    error: 'Route not found.'
+  });
 }
 
 async function startServer() {
@@ -549,7 +629,9 @@ async function startServer() {
       console.error('Request error:', error.message);
 
       if (!res.headersSent) {
-        send(res, 500, { error: 'Internal server error.' });
+        send(res, 500, {
+          error: 'Internal server error.'
+        });
       } else {
         res.end();
       }
@@ -558,6 +640,7 @@ async function startServer() {
 
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`SCANTY MD BOT running on port ${PORT}`);
+    console.log('Allowed dashboard origin:', DASHBOARD_ORIGIN);
   });
 }
 
