@@ -41,7 +41,12 @@ function fakeTimers() {
   };
 }
 
-function cleanupMaps(socket = {}, controller = {}) {
+function cleanupMaps(socket = {}, controller = {
+  stopped: false,
+  stop() {
+    this.stopped = true;
+  }
+}) {
   const context = { controller, expectedSocket: socket, captureQr: true };
   return {
     socket,
