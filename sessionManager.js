@@ -54,9 +54,7 @@ function delay(ms) {
 function normalizeQrValue(qr) {
   if (!qr) return null;
 
-  if (typeof qr === 'string') {
-    return qr;
-  }
+  if (typeof qr === 'string') return qr;
 
   if (Buffer.isBuffer(qr)) {
     return qr.toString('base64');
@@ -284,7 +282,7 @@ async function sendScantyWelcome(userId, sock) {
         'Send .menu to see all commands.\n\n' +
         '━━━━━━━━━━━━━━━━━\n' +
         '💬 Message Developer: +233538573022\n' +
-        '━━━━━━━━━━━━━━━━━'
+        '━━━━━━━━━━━━━━━━'
     });
 
     await saveRecord(
