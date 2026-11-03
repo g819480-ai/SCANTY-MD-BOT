@@ -4,6 +4,7 @@ import http from 'node:http';
 import pg from 'pg';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import crypto from 'node:crypto';
 
 import {
   initializeSessionStorage,
@@ -53,7 +54,6 @@ function send(res, status, data) {
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff'
   });
-
   res.end(JSON.stringify(data));
 }
 
@@ -63,7 +63,6 @@ function readBody(req) {
 
     req.on('data', chunk => {
       body += chunk;
-
       if (body.length > 10000) {
         reject(new Error('Request body too large'));
         req.destroy();
@@ -82,38 +81,41 @@ function readBody(req) {
   });
 }
 
-function createToken(user) {
+function createToken(user, isGuest = false) {
   return jwt.sign(
-    { userId: user.id },
+    { userId: user.id, guest: isGuest },
     JWT_SECRET,
-    { expiresIn: '1h' }
+    { expiresIn: isGuest ? '7d' : '1h' }
   );
 }
 
 function getToken(req) {
   const header = req.headers.authorization || '';
-
   if (!header.startsWith('Bearer ')) return null;
-
   return header.slice(7);
 }
 
 async function authenticatedUser(req) {
   const token = getToken(req);
-
   if (!token) return null;
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
 
     const result = await pool.query(
-      `SELECT id, email, role, created_at
+      `SELECT id, email, role, is_guest, created_at
        FROM users
        WHERE id = $1`,
       [decoded.userId]
     );
 
-    return result.rows[0] || null;
+    const user = result.rows[0];
+    if (!user) return null;
+
+    if (decoded.guest && !user.is_guest) return null;
+    if (!decoded.guest && user.is_guest) return null;
+
+    return user;
   } catch {
     return null;
   }
@@ -135,6 +137,11 @@ async function initializeDatabase() {
   `);
 
   await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS is_guest BOOLEAN NOT NULL DEFAULT FALSE
+  `);
+
+  await pool.query(`
     UPDATE users
     SET role = 'user'
     WHERE role IS NULL OR role NOT IN ('user', 'admin')
@@ -143,9 +150,13 @@ async function initializeDatabase() {
   const passwordHash = await bcrypt.hash(ADMIN_PASSWORD, 12);
 
   await pool.query(
-    `INSERT INTO users (email, password_hash, role)
-     VALUES ($1, $2, 'admin')
-     ON CONFLICT (email) DO NOTHING`,
+    `INSERT INTO users (email, password_hash, role, is_guest)
+     VALUES ($1, $2, 'admin', FALSE)
+     ON CONFLICT (email)
+     DO UPDATE SET
+       password_hash = EXCLUDED.password_hash,
+       role = 'admin',
+       is_guest = FALSE`,
     [ADMIN_EMAIL, passwordHash]
   );
 
@@ -184,21 +195,13 @@ async function handleRequest(req, res) {
     res.setHeader('Vary', 'Origin');
   }
 
-  res.setHeader(
-    'Access-Control-Allow-Methods',
-    'GET, POST, OPTIONS'
-  );
-
-  res.setHeader(
-    'Access-Control-Allow-Headers',
-    'Content-Type, Authorization'
-  );
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
   if (req.method === 'OPTIONS') {
     if (origin && origin !== DASHBOARD_ORIGIN) {
       return send(res, 403, { error: 'Origin not allowed.' });
     }
-
     res.writeHead(204);
     return res.end();
   }
@@ -211,8 +214,6 @@ async function handleRequest(req, res) {
     req.url,
     `http://${req.headers.host || 'localhost'}`
   );
-
-  // Health checks
 
   if (req.method === 'GET' && url.pathname === '/') {
     return send(res, 200, {
@@ -229,119 +230,112 @@ async function handleRequest(req, res) {
   if (req.method === 'GET' && url.pathname === '/db-health') {
     try {
       await pool.query('SELECT NOW()');
-
       return send(res, 200, {
         status: 'connected',
         database: 'Neon PostgreSQL'
       });
     } catch (error) {
       console.error('Database health error:', error.message);
+      return send(res, 503, { status: 'disconnected' });
+    }
+  }
 
-      return send(res, 503, {
-        status: 'disconnected'
+  // Public visitor session. No account or password is required.
+  if (
+    req.method === 'POST' &&
+    url.pathname === '/api/public/session'
+  ) {
+    if (rateLimit(req, res, 5)) return;
+
+    try {
+      const guestId = crypto.randomUUID();
+      const guestEmail = `guest-${guestId}@guest.scanty.invalid`;
+      const randomPassword = crypto.randomBytes(48).toString('hex');
+      const passwordHash = await bcrypt.hash(randomPassword, 10);
+
+      const result = await pool.query(
+        `INSERT INTO users
+          (id, email, password_hash, role, is_guest)
+         VALUES ($1, $2, $3, 'user', TRUE)
+         RETURNING id`,
+        [guestId, guestEmail, passwordHash]
+      );
+
+      const guest = result.rows[0];
+
+      return send(res, 201, {
+        success: true,
+        token: createToken(guest, true),
+        message: 'Private pairing session created.'
+      });
+    } catch (error) {
+      console.error('Guest session creation failed:', error.message);
+      return send(res, 500, {
+        error: 'Could not create a pairing session. Please try again.'
       });
     }
   }
 
-  // Registration and login
+  // Public registration is disabled. Only the administrator can log in.
+  if (
+    req.method === 'POST' &&
+    url.pathname === '/api/auth/register'
+  ) {
+    return send(res, 403, {
+      error: 'Public registration is disabled.'
+    });
+  }
 
   if (
     req.method === 'POST' &&
-    (
-      url.pathname === '/api/auth/register' ||
-      url.pathname === '/api/auth/login'
-    )
+    url.pathname === '/api/auth/login'
   ) {
-    if (rateLimit(req, res)) return;
+    if (rateLimit(req, res, 5)) return;
 
     let body;
-
     try {
       body = await readBody(req);
     } catch {
-      return send(res, 400, {
-        error: 'Invalid request body.'
-      });
+      return send(res, 400, { error: 'Invalid request body.' });
     }
 
     const email = String(body.email || '').trim().toLowerCase();
     const password = body.password;
 
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return send(res, 400, {
-        error: 'Enter a valid email address.'
-      });
-    }
-
     if (
+      email !== ADMIN_EMAIL ||
       typeof password !== 'string' ||
-      password.length < 8 ||
+      password.length < 1 ||
       Buffer.byteLength(password, 'utf8') > 72
     ) {
-      return send(res, 400, {
-        error: 'Password must be at least 8 characters and no more than 72 bytes.'
+      return send(res, 401, {
+        error: 'Incorrect administrator email or password.'
       });
-    }
-
-    if (url.pathname === '/api/auth/register') {
-      if (email === ADMIN_EMAIL) {
-        return send(res, 403, {
-          error: 'This email is reserved for the administrator.'
-        });
-      }
-
-      try {
-        const passwordHash = await bcrypt.hash(password, 12);
-
-        const result = await pool.query(
-          `INSERT INTO users (email, password_hash, role)
-           VALUES ($1, $2, 'user')
-           RETURNING id, email, role, created_at`,
-          [email, passwordHash]
-        );
-
-        const user = result.rows[0];
-
-        return send(res, 201, {
-          success: true,
-          message: 'Account created successfully.',
-          user,
-          token: createToken(user)
-        });
-      } catch (error) {
-        if (error.code === '23505') {
-          return send(res, 409, {
-            error: 'This email is already registered.'
-          });
-        }
-
-        console.error('Registration error:', error.message);
-
-        return send(res, 500, {
-          error: 'Registration could not be completed.'
-        });
-      }
     }
 
     try {
       const result = await pool.query(
-        `SELECT id, email, password_hash, role, created_at
+        `SELECT id, email, password_hash, role
          FROM users
-         WHERE email = $1`,
-        [email]
+         WHERE email = $1 AND is_guest = FALSE`,
+        [ADMIN_EMAIL]
       );
 
       const user = result.rows[0];
 
-      if (!user || !(await bcrypt.compare(password, user.password_hash))) {
+      if (
+        !user ||
+        user.role !== 'admin' ||
+        !(await bcrypt.compare(password, user.password_hash))
+      ) {
         return send(res, 401, {
-          error: 'Incorrect email or password.'
+          error: 'Incorrect administrator email or password.'
         });
       }
 
       return send(res, 200, {
         success: true,
-        message: 'Login successful.',
+        message: 'Administrator login successful.',
         user: {
           id: user.id,
           email: user.email,
@@ -350,33 +344,33 @@ async function handleRequest(req, res) {
         token: createToken(user)
       });
     } catch (error) {
-      console.error('Login error:', error.message);
-
+      console.error('Admin login error:', error.message);
       return send(res, 500, {
-        error: 'Login could not be completed.'
+        error: 'Administrator login could not be completed.'
       });
     }
   }
 
-  // Current logged-in user
-
   if (req.method === 'GET' && url.pathname === '/api/auth/me') {
     const user = await authenticatedUser(req);
 
-    if (!user) {
+    if (!user || user.is_guest || user.role !== 'admin') {
       return send(res, 401, {
-        error: 'Please log in again.'
+        error: 'Administrator login required.'
       });
     }
 
     return send(res, 200, {
       success: true,
-      user
+      user: {
+        id: user.id,
+        email: user.email,
+        role: user.role
+      }
     });
   }
 
-  // Start QR pairing
-
+  // QR pairing: each visitor token maps to a different guest UUID.
   if (
     req.method === 'POST' &&
     url.pathname === '/api/whatsapp/qr'
@@ -384,10 +378,9 @@ async function handleRequest(req, res) {
     if (rateLimit(req, res, 5)) return;
 
     const user = await authenticatedUser(req);
-
     if (!user) {
       return send(res, 401, {
-        error: 'Please log in before connecting WhatsApp.'
+        error: 'Create a pairing session before connecting WhatsApp.'
       });
     }
 
@@ -401,14 +394,11 @@ async function handleRequest(req, res) {
       });
     } catch (error) {
       console.error('WhatsApp QR start error:', error.message);
-
       return send(res, 400, {
         error: error.message || 'Could not start QR pairing.'
       });
     }
   }
-
-  // Retrieve QR pairing state
 
   if (
     req.method === 'GET' &&
@@ -417,10 +407,9 @@ async function handleRequest(req, res) {
     if (rateLimit(req, res, 60)) return;
 
     const user = await authenticatedUser(req);
-
     if (!user) {
       return send(res, 401, {
-        error: 'Please log in before checking WhatsApp pairing.'
+        error: 'Create a pairing session before checking WhatsApp pairing.'
       });
     }
 
@@ -430,8 +419,7 @@ async function handleRequest(req, res) {
     });
   }
 
-  // WhatsApp pairing code
-
+  // Phone-number pairing.
   if (
     req.method === 'POST' &&
     url.pathname === '/api/whatsapp/pair'
@@ -439,24 +427,21 @@ async function handleRequest(req, res) {
     if (rateLimit(req, res, 5)) return;
 
     const user = await authenticatedUser(req);
-
     if (!user) {
       return send(res, 401, {
-        error: 'Please log in before connecting WhatsApp.'
+        error: 'Create a pairing session before connecting WhatsApp.'
       });
     }
 
     let body;
-
     try {
       body = await readBody(req);
     } catch {
-      return send(res, 400, {
-        error: 'Invalid request body.'
-      });
+      return send(res, 400, { error: 'Invalid request body.' });
     }
 
-    const phoneNumber = String(body.phoneNumber || '').replace(/[\s+()-]/g, '');
+    const phoneNumber = String(body.phoneNumber || '')
+      .replace(/[\s+()-]/g, '');
 
     if (!/^\d{10,15}$/.test(phoneNumber)) {
       return send(res, 400, {
@@ -488,15 +473,13 @@ async function handleRequest(req, res) {
       });
     } catch (error) {
       console.error('WhatsApp pairing error:', error.message);
-
       return send(res, 400, {
         error: error.message || 'Could not start WhatsApp pairing.'
       });
     }
   }
 
-  // Admin dashboard
-
+  // Admin-only dashboard data.
   if (
     req.method === 'GET' &&
     (
@@ -506,7 +489,7 @@ async function handleRequest(req, res) {
   ) {
     const user = await authenticatedUser(req);
 
-    if (!user || user.role !== 'admin') {
+    if (!user || user.is_guest || user.role !== 'admin') {
       return send(res, 403, {
         error: 'Administrator access required.'
       });
@@ -516,9 +499,13 @@ async function handleRequest(req, res) {
       if (url.pathname === '/api/admin/stats') {
         const result = await pool.query(`
           SELECT
-            COUNT(*)::int AS total_users,
-            COUNT(*) FILTER (WHERE role = 'admin')::int AS total_admins,
-            COUNT(*) FILTER (WHERE role = 'user')::int AS total_members
+            COUNT(*) FILTER (WHERE is_guest = FALSE)::int AS total_users,
+            COUNT(*) FILTER (
+              WHERE role = 'admin' AND is_guest = FALSE
+            )::int AS total_admins,
+            COUNT(*) FILTER (
+              WHERE role = 'user' AND is_guest = FALSE
+            )::int AS total_members
           FROM users
         `);
 
@@ -531,6 +518,7 @@ async function handleRequest(req, res) {
       const result = await pool.query(`
         SELECT id, email, role, created_at
         FROM users
+        WHERE is_guest = FALSE
         ORDER BY created_at DESC
         LIMIT 100
       `);
@@ -541,16 +529,13 @@ async function handleRequest(req, res) {
       });
     } catch (error) {
       console.error('Admin request error:', error.message);
-
       return send(res, 500, {
         error: 'Could not load admin data.'
       });
     }
   }
 
-  return send(res, 404, {
-    error: 'Route not found.'
-  });
+  return send(res, 404, { error: 'Route not found.' });
 }
 
 async function startServer() {
@@ -564,9 +549,7 @@ async function startServer() {
       console.error('Request error:', error.message);
 
       if (!res.headersSent) {
-        send(res, 500, {
-          error: 'Internal server error.'
-        });
+        send(res, 500, { error: 'Internal server error.' });
       } else {
         res.end();
       }
