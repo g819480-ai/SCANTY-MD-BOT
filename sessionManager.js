@@ -1,10 +1,10 @@
-
 import makeWASocket, {
   initAuthCreds,
   BufferJSON,
   proto,
   Browsers,
-  fetchLatestBaileysVersion
+  fetchLatestBaileysVersion,
+  DisconnectReason
 } from '@whiskeysockets/baileys';
 
 import pino from 'pino';
@@ -48,6 +48,30 @@ const encryptionKey = crypto
 
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function normalizeQrValue(qr) {
+  if (!qr) return null;
+
+  if (typeof qr === 'string') {
+    return qr;
+  }
+
+  if (Buffer.isBuffer(qr)) {
+    return qr.toString('base64');
+  }
+
+  if (typeof qr === 'object') {
+    if (typeof qr.data !== 'undefined') {
+      return Buffer.from(qr.data).toString('base64');
+    }
+
+    if (typeof qr.toString === 'function' && qr.toString() !== '[object Object]') {
+      return qr.toString();
+    }
+  }
+
+  return String(qr);
 }
 
 function encrypt(value) {
@@ -217,7 +241,6 @@ function startPresenceHeartbeat(userId, sock) {
   presenceTimers.set(userId, timer);
 }
 
-// Send the welcome image and text as two separate messages.
 async function sendScantyWelcome(userId, sock) {
   try {
     const alreadyWelcomed = await readRecord(
@@ -245,13 +268,11 @@ async function sendScantyWelcome(userId, sock) {
       new URL('./scanty-md-welcome-final.jpg', import.meta.url)
     );
 
-    // First message: picture only.
     await sock.sendMessage(ownJid, {
       image,
       mimetype: 'image/jpeg'
     });
 
-    // Second message: text only.
     await sock.sendMessage(ownJid, {
       text:
         '✅ Bot Connected Successfully\n\n' +
@@ -293,7 +314,23 @@ async function attachSocket(userId, state, captureQr = false) {
     version,
     markOnlineOnConnect: false,
     syncFullHistory: false,
-    generateHighQualityLinkPreview: false
+    generateHighQualityLinkPreview: false,
+    keepAliveIntervalMs: 30000,
+    connectTimeoutMs: 30000,
+    shouldReconnect: (retryCount, cause) => {
+      const statusCode = cause?.output?.statusCode;
+
+      if (
+        statusCode === DisconnectReason.loggedOut ||
+        statusCode === DisconnectReason.connectionReplaced ||
+        statusCode === DisconnectReason.badSession ||
+        statusCode === DisconnectReason.restartRequired
+      ) {
+        return false;
+      }
+
+      return retryCount < 10;
+    }
   });
 
   sessions.set(userId, sock);
@@ -334,9 +371,18 @@ async function attachSocket(userId, state, captureQr = false) {
     async ({ connection, lastDisconnect, qr }) => {
       if (sessions.get(userId) !== sock) return;
 
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const isTerminalDisconnect =
+        statusCode === DisconnectReason.loggedOut ||
+        statusCode === DisconnectReason.connectionReplaced ||
+        statusCode === DisconnectReason.badSession ||
+        statusCode === DisconnectReason.restartRequired;
+
       if (captureQr && qr) {
+        const normalizedQr = normalizeQrValue(qr);
+
         qrStates.set(userId, {
-          qr,
+          qr: normalizedQr,
           status: 'qr',
           updatedAt: Date.now()
         });
@@ -360,6 +406,7 @@ async function attachSocket(userId, state, captureQr = false) {
         await sendScantyWelcome(userId, sock);
 
         startPresenceHeartbeat(userId, sock);
+        return;
       }
 
       if (connection === 'connecting') {
@@ -376,28 +423,34 @@ async function attachSocket(userId, state, captureQr = false) {
             });
           }
         }
+
+        return;
       }
 
       if (connection === 'close') {
-        sessionStatus.set(userId, 'disconnected');
-
-        if (captureQr) {
-          qrStates.set(userId, {
-            qr: null,
-            status: 'disconnected',
-            updatedAt: Date.now()
-          });
-        }
-
         stopPresenceHeartbeat(userId);
 
-        if (sessions.get(userId) === sock) {
-          sessions.delete(userId);
+        if (isTerminalDisconnect) {
+          sessionStatus.set(userId, 'disconnected');
+
+          if (captureQr) {
+            qrStates.set(userId, {
+              qr: null,
+              status: 'disconnected',
+              updatedAt: Date.now()
+            });
+          }
+
+          if (sessions.get(userId) === sock) {
+            sessions.delete(userId);
+          }
+        } else {
+          sessionStatus.set(userId, 'reconnecting');
         }
 
         console.error('WHATSAPP DISCONNECT DETAILS:', {
           userId,
-          statusCode: lastDisconnect?.error?.output?.statusCode,
+          statusCode,
           message: lastDisconnect?.error?.message,
           error: lastDisconnect?.error?.toString()
         });
@@ -492,9 +545,16 @@ export async function startUserQrSession(userId) {
   }
 
   if (sessions.has(userId)) {
-    throw new Error(
-      'A WhatsApp session is already active for this user.'
-    );
+    const staleSocket = sessions.get(userId);
+    if (staleSocket && typeof staleSocket.end === 'function') {
+      try {
+        staleSocket.end(new Error('Restarting QR session.'));
+      } catch {
+        // no-op
+      }
+    }
+    sessions.delete(userId);
+    stopPresenceHeartbeat(userId);
   }
 
   const savedCreds = await readRecord(
