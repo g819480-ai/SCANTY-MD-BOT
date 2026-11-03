@@ -1,4 +1,3 @@
-
 import 'dotenv/config';
 import http from 'node:http';
 import pg from 'pg';
@@ -15,6 +14,13 @@ import {
 } from './sessionManager.js';
 
 import { initializeFeatureSettings } from './featureSettings.js';
+import {
+  isValidPhoneNumber,
+  isValidUserId,
+  normalizePhoneNumber,
+  parseDashboardOrigins,
+  resolveAllowedOrigin
+} from './utils/validation.js';
 
 const { Pool } = pg;
 
@@ -22,16 +28,23 @@ const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
 const JWT_SECRET = process.env.JWT_SECRET;
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL?.trim().toLowerCase();
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD?.trim();
+const SESSION_ENCRYPTION_KEY = process.env.SESSION_ENCRYPTION_KEY?.trim();
 
-const DASHBOARD_ORIGIN = (
-  process.env.DASHBOARD_ORIGIN ||
-  'https://scanty-md-dashboard.g819480.workers.dev'
-).trim().replace(/\/+$/, '');
+const DASHBOARD_ORIGINS = parseDashboardOrigins(
+  process.env.DASHBOARD_ORIGINS || process.env.DASHBOARD_ORIGIN ||
+    'https://scanty-md-dashboard.g819480.workers.dev'
+);
 
 if (!DATABASE_URL || !JWT_SECRET || JWT_SECRET.length < 32) {
   throw new Error(
     'DATABASE_URL and a JWT_SECRET of at least 32 characters are required.'
+  );
+}
+
+if (!SESSION_ENCRYPTION_KEY || SESSION_ENCRYPTION_KEY.length < 64) {
+  throw new Error(
+    'SESSION_ENCRYPTION_KEY must be present and at least 64 characters long.'
   );
 }
 
@@ -70,15 +83,20 @@ function readBody(req) {
     req.on('data', chunk => {
       body += chunk;
 
-      if (body.length > 10000) {
+      if (body.length > 20000) {
         reject(new Error('Request body too large'));
         req.destroy();
       }
     });
 
     req.on('end', () => {
+      if (!body.trim()) {
+        resolve({});
+        return;
+      }
+
       try {
-        resolve(JSON.parse(body || '{}'));
+        resolve(JSON.parse(body));
       } catch {
         reject(new Error('Invalid JSON'));
       }
@@ -204,57 +222,34 @@ function rateLimit(req, res, limit = 20) {
 
 async function handleRequest(req, res) {
   const origin = req.headers.origin;
+  const allowedOrigin = resolveAllowedOrigin(origin, DASHBOARD_ORIGINS);
 
-  // CORS diagnostics: log both values without exposing secrets.
-  console.log('CORS CHECK:', {
-    method: req.method,
-    path: req.url,
-    receivedOrigin: origin || '(no origin)',
-    allowedOrigin: DASHBOARD_ORIGIN
-  });
-
-  if (origin === DASHBOARD_ORIGIN) {
-    res.setHeader('Access-Control-Allow-Origin', DASHBOARD_ORIGIN);
-    res.setHeader('Vary', 'Origin');
-  }
-
-  res.setHeader(
-    'Access-Control-Allow-Methods',
-    'GET, POST, OPTIONS'
-  );
-
-  res.setHeader(
-    'Access-Control-Allow-Headers',
-    'Content-Type, Authorization'
-  );
-
-  res.setHeader('Access-Control-Max-Age', '600');
-
-  if (req.method === 'OPTIONS') {
-    if (origin && origin !== DASHBOARD_ORIGIN) {
-      console.error('CORS BLOCKED:', {
-        receivedOrigin: origin,
-        allowedOrigin: DASHBOARD_ORIGIN
-      });
-
-      return send(res, 403, {
-        error: 'Origin not allowed.'
-      });
-    }
-
-    res.writeHead(204);
-    return res.end();
-  }
-
-  if (origin && origin !== DASHBOARD_ORIGIN) {
+  if (origin && !allowedOrigin) {
     console.error('CORS BLOCKED:', {
       receivedOrigin: origin,
-      allowedOrigin: DASHBOARD_ORIGIN
+      allowedOrigins: DASHBOARD_ORIGINS
     });
 
     return send(res, 403, {
       error: 'Origin not allowed.'
     });
+  }
+
+  if (allowedOrigin) {
+    res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
+    res.setHeader('Vary', 'Origin');
+  }
+
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'Content-Type, Authorization'
+  );
+  res.setHeader('Access-Control-Max-Age', '600');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    return res.end();
   }
 
   const url = new URL(
@@ -293,11 +288,7 @@ async function handleRequest(req, res) {
     }
   }
 
-  // Public visitor session.
-  if (
-    req.method === 'POST' &&
-    url.pathname === '/api/public/session'
-  ) {
+  if (req.method === 'POST' && url.pathname === '/api/public/session') {
     if (rateLimit(req, res, 5)) return;
 
     try {
@@ -333,21 +324,13 @@ async function handleRequest(req, res) {
     }
   }
 
-  // Public registration is disabled.
-  if (
-    req.method === 'POST' &&
-    url.pathname === '/api/auth/register'
-  ) {
+  if (req.method === 'POST' && url.pathname === '/api/auth/register') {
     return send(res, 403, {
       error: 'Public registration is disabled.'
     });
   }
 
-  // Administrator login.
-  if (
-    req.method === 'POST' &&
-    url.pathname === '/api/auth/login'
-  ) {
+  if (req.method === 'POST' && url.pathname === '/api/auth/login') {
     if (rateLimit(req, res, 5)) return;
 
     let body;
@@ -413,7 +396,6 @@ async function handleRequest(req, res) {
     }
   }
 
-  // Check administrator login.
   if (req.method === 'GET' && url.pathname === '/api/auth/me') {
     const user = await authenticatedUser(req);
 
@@ -433,13 +415,7 @@ async function handleRequest(req, res) {
     });
   }
 
-  // Start QR pairing.
-  if (
-    req.method === 'POST' &&
-    url.pathname === '/api/whatsapp/qr'
-  ) {
-    
-
+  if (req.method === 'POST' && url.pathname === '/api/whatsapp/qr') {
     const user = await authenticatedUser(req);
 
     if (!user) {
@@ -465,11 +441,7 @@ async function handleRequest(req, res) {
     }
   }
 
-  // Check QR pairing state.
-  if (
-    req.method === 'GET' &&
-    url.pathname === '/api/whatsapp/qr'
-  ) {
+  if (req.method === 'GET' && url.pathname === '/api/whatsapp/qr') {
     if (rateLimit(req, res, 60)) return;
 
     const user = await authenticatedUser(req);
@@ -486,11 +458,7 @@ async function handleRequest(req, res) {
     });
   }
 
-  // Phone-number pairing.
-  if (
-    req.method === 'POST' &&
-    url.pathname === '/api/whatsapp/pair'
-  ) {
+  if (req.method === 'POST' && url.pathname === '/api/whatsapp/pair') {
     if (rateLimit(req, res, 5)) return;
 
     const user = await authenticatedUser(req);
@@ -511,12 +479,17 @@ async function handleRequest(req, res) {
       });
     }
 
-    const phoneNumber = String(body.phoneNumber || '')
-      .replace(/[\s+()-]/g, '');
+    const phoneNumber = normalizePhoneNumber(body.phoneNumber);
 
-    if (!/^\d{10,15}$/.test(phoneNumber)) {
+    if (!isValidPhoneNumber(phoneNumber)) {
       return send(res, 400, {
         error: 'Enter your phone number with country code, using digits only.'
+      });
+    }
+
+    if (!isValidUserId(user.id)) {
+      return send(res, 400, {
+        error: 'Invalid user session.'
       });
     }
 
@@ -540,7 +513,12 @@ async function handleRequest(req, res) {
       return send(res, 200, {
         success: true,
         message: 'Pairing code generated. Enter it in WhatsApp Linked Devices.',
-        pairingCode
+        pairingCode,
+        advertising: {
+          placement: 'pairing-code',
+          compliant: true,
+          policy: 'Neutral, non-intrusive, no forced clicks or deceptive UI.'
+        }
       });
     } catch (error) {
       console.error('WhatsApp pairing error:', error.message);
@@ -551,13 +529,9 @@ async function handleRequest(req, res) {
     }
   }
 
-  // Administrator-only dashboard data.
   if (
     req.method === 'GET' &&
-    (
-      url.pathname === '/api/admin/stats' ||
-      url.pathname === '/api/admin/users'
-    )
+    (url.pathname === '/api/admin/stats' || url.pathname === '/api/admin/users')
   ) {
     const user = await authenticatedUser(req);
 
@@ -640,7 +614,7 @@ async function startServer() {
 
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`SCANTY MD BOT running on port ${PORT}`);
-    console.log('Allowed dashboard origin:', DASHBOARD_ORIGIN);
+    console.log('Allowed dashboard origins:', DASHBOARD_ORIGINS);
   });
 }
 
