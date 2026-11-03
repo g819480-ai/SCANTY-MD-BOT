@@ -9,6 +9,7 @@ import makeWASocket, {
 
 import pino from 'pino';
 import crypto from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import pg from 'pg';
 
 import { handleIncomingMessage } from './messageHandler.js';
@@ -216,6 +217,67 @@ function startPresenceHeartbeat(userId, sock) {
   presenceTimers.set(userId, timer);
 }
 
+// Send the welcome image and text as two separate messages.
+async function sendScantyWelcome(userId, sock) {
+  try {
+    const alreadyWelcomed = await readRecord(
+      userId,
+      'meta',
+      'welcome_notice_sent'
+    );
+
+    if (alreadyWelcomed) {
+      console.log(`Welcome sequence already sent for ${userId}`);
+      return;
+    }
+
+    const linkedJid = sock.user?.id;
+
+    if (!linkedJid) {
+      throw new Error('Could not determine the connected WhatsApp account.');
+    }
+
+    const ownJid = linkedJid.endsWith('@s.whatsapp.net')
+      ? `${linkedJid.split('@')[0].split(':')[0]}@s.whatsapp.net`
+      : linkedJid;
+
+    const image = await readFile(
+      new URL('./scanty-md-welcome-final.jpg', import.meta.url)
+    );
+
+    // First message: picture only.
+    await sock.sendMessage(ownJid, {
+      image,
+      mimetype: 'image/jpeg'
+    });
+
+    // Second message: text only.
+    await sock.sendMessage(ownJid, {
+      text:
+        '✅ Bot Connected Successfully\n\n' +
+        'Welcome to SCANTY MD 👑\n\n' +
+        'Send .menu to see all commands.\n\n' +
+        '━━━━━━━━━━━━━━━━━\n' +
+        '💬 Message Developer: +233538573022\n' +
+        '━━━━━━━━━━━━━━━━━'
+    });
+
+    await saveRecord(
+      userId,
+      'meta',
+      'welcome_notice_sent',
+      true
+    );
+
+    console.log(`SCANTY MD welcome sequence sent for ${userId}`);
+  } catch (error) {
+    console.error(
+      `SCANTY MD welcome sequence failed for ${userId}:`,
+      error.message
+    );
+  }
+}
+
 async function attachSocket(userId, state, captureQr = false) {
   console.log('Fetching the latest WhatsApp Web version...');
 
@@ -223,8 +285,6 @@ async function attachSocket(userId, state, captureQr = false) {
 
   console.log('Using WhatsApp Web version:', version);
 
-  // Silva-inspired socket configuration.
-  // SCANTY's own Neon authentication storage remains unchanged.
   const sock = makeWASocket({
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
@@ -296,6 +356,8 @@ async function attachSocket(userId, state, captureQr = false) {
         }
 
         console.log(`WhatsApp connected for user ${userId}`);
+
+        await sendScantyWelcome(userId, sock);
 
         startPresenceHeartbeat(userId, sock);
       }
@@ -506,7 +568,7 @@ export async function startUserSession(
       sessionStatus.get(userId) === 'disconnected'
     ) {
       throw new Error(
-        'WhatsApp socket closed before pairing. Check Render logs for WHATSAPP DISCONNECT DETAILS.'
+        'WhatsApp socket closed before pairing. Check deployment logs for disconnect details.'
       );
     }
 
