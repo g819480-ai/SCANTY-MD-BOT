@@ -414,8 +414,32 @@ async function attachSocket(
     }
   });
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
+sock.ev.on('messages.upsert', async ({ messages, type }) => {
+  console.log('WHATSAPP MESSAGE EVENT:', {
+    type,
+    count: messages?.length || 0
+  });
+
+  if (type !== 'notify' && type !== 'append') return;
+
+  for (const message of messages || []) {
+    try {
+      // Append events are used here only for messages sent by this account.
+      if (type === 'append' && !message.key?.fromMe) continue;
+
+      if (message.key?.remoteJid === 'status@broadcast') {
+        await handleStatusUpdate(sock, userId, message);
+      } else {
+        await handleIncomingMessage(sock, userId, message);
+      }
+    } catch (error) {
+      console.error(
+        'Incoming message processing failed:',
+        error.message
+      );
+    }
+  }
+});
 
     for (const message of messages) {
       try {
