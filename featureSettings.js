@@ -17,8 +17,22 @@ const DEFAULT_SETTINGS = {
   antiLink: false,
   welcome: false,
   goodbye: false,
-  autoReact: false
+  autoReact: false,
+
+  // Command settings
+  prefix: '.',
+
+  // AI settings
+  aiChatEnabled: false,
+  aiPersonality: 'friendly'
 };
+
+const ALLOWED_PERSONALITIES = [
+  'friendly',
+  'professional',
+  'funny',
+  'casual'
+];
 
 export async function initializeFeatureSettings() {
   await pool.query(`
@@ -49,6 +63,39 @@ export async function setFeatureSetting(userId, key, value) {
     throw new Error('Unknown bot setting.');
   }
 
+  if (key === 'prefix') {
+    if (
+      typeof value !== 'string' ||
+      !/^[^\p{L}\p{N}\s]{1,3}$/u.test(value)
+    ) {
+      throw new Error(
+        'Prefix must contain 1 to 3 punctuation symbols.'
+      );
+    }
+  }
+
+  if (key === 'aiChatEnabled' && typeof value !== 'boolean') {
+    throw new Error('AI chat setting must be true or false.');
+  }
+
+  if (
+    key === 'aiPersonality' &&
+    !ALLOWED_PERSONALITIES.includes(value)
+  ) {
+    throw new Error('Invalid AI personality.');
+  }
+
+  if (
+    key === 'statusEmojis' &&
+    (!Array.isArray(value) ||
+      value.length > 20 ||
+      value.some(
+        emoji => typeof emoji !== 'string' || emoji.length > 20
+      ))
+  ) {
+    throw new Error('Invalid status emoji list.');
+  }
+
   const current = await getFeatureSettings(userId);
   current[key] = value;
 
@@ -62,4 +109,8 @@ export async function setFeatureSetting(userId, key, value) {
   );
 
   return current;
+}
+
+export async function getDefaultFeatureSettings() {
+  return { ...DEFAULT_SETTINGS };
 }
