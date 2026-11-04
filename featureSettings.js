@@ -21,6 +21,8 @@ const DEFAULT_SETTINGS = Object.freeze({
   welcome: false,
   goodbye: false,
   autoReact: false,
+  aiChatEnabled: false,
+  aiPersonality: 'friendly',
   prefix: '.'
 });
 
@@ -40,6 +42,7 @@ export async function initializeFeatureSettings() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS bot_bans (
       owner_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -55,7 +58,9 @@ export async function getFeatureSettings(userId) {
     'SELECT settings FROM bot_settings WHERE user_id = $1',
     [userId]
   );
+
   const saved = result.rows[0]?.settings || {};
+
   return {
     ...DEFAULT_SETTINGS,
     ...saved,
@@ -66,75 +71,144 @@ export async function getFeatureSettings(userId) {
 }
 
 function validateSetting(key, value) {
-  if (!(key in DEFAULT_SETTINGS)) throw new Error('Unknown bot setting.');
+  if (!(key in DEFAULT_SETTINGS)) {
+    throw new Error('Unknown bot setting.');
+  }
+
   if (key === 'statusEmojis') {
-    if (!Array.isArray(value) || value.length < 1 || value.length > 10 ||
-        value.some(emoji => typeof emoji !== 'string' || !emoji.trim() || emoji.length > 16)) {
-      throw new Error('statusEmojis must contain between 1 and 10 short emoji values.');
+    if (
+      !Array.isArray(value) ||
+      value.length < 1 ||
+      value.length > 10 ||
+      value.some(
+        emoji =>
+          typeof emoji !== 'string' ||
+          !emoji.trim() ||
+          emoji.length > 16
+      )
+    ) {
+      throw new Error(
+        'statusEmojis must contain between 1 and 10 short emoji values.'
+      );
     }
+
     return [...new Set(value.map(emoji => emoji.trim()))];
   }
+
   if (key === 'prefix') {
-    if (typeof value !== 'string' || value.length < 1 || value.length > 3 || /\s/.test(value)) {
-      throw new Error('prefix must be 1 to 3 non-whitespace characters.');
+    if (
+      typeof value !== 'string' ||
+      value.length < 1 ||
+      value.length > 3 ||
+      /\s/.test(value)
+    ) {
+      throw new Error(
+        'prefix must be 1 to 3 non-whitespace characters.'
+      );
     }
+
     return value;
   }
-  if (typeof value !== 'boolean') throw new Error(`${key} must be true or false.`);
+
+  if (key === 'aiPersonality') {
+    if (
+      typeof value !== 'string' ||
+      value.trim().length < 1 ||
+      value.trim().length > 40 ||
+      /[\u0000-\u001F\u007F]/.test(value)
+    ) {
+      throw new Error(
+        'aiPersonality must be a valid text value of up to 40 characters.'
+      );
+    }
+
+    return value.trim();
+  }
+
+  if (typeof value !== 'boolean') {
+    throw new Error(`${key} must be true or false.`);
+  }
+
   return value;
 }
 
 export async function setFeatureSetting(userId, key, value) {
   const validatedValue = validateSetting(key, value);
   const current = await getFeatureSettings(userId);
+
   current[key] = validatedValue;
+
   await pool.query(
     `INSERT INTO bot_settings (user_id, settings, updated_at)
      VALUES ($1, $2::jsonb, NOW())
      ON CONFLICT (user_id)
-     DO UPDATE SET settings = EXCLUDED.settings, updated_at = NOW()`,
+     DO UPDATE SET
+       settings = EXCLUDED.settings,
+       updated_at = NOW()`,
     [userId, JSON.stringify(current)]
   );
+
   return current;
 }
 
 export async function listBotBans(userId) {
   const result = await pool.query(
-    `SELECT phone_number, created_at FROM bot_bans
-     WHERE owner_user_id = $1 ORDER BY created_at DESC`,
+    `SELECT phone_number, created_at
+     FROM bot_bans
+     WHERE owner_user_id = $1
+     ORDER BY created_at DESC`,
     [userId]
   );
-  return result.rows.map(row => ({ phoneNumber: row.phone_number, createdAt: row.created_at }));
+
+  return result.rows.map(row => ({
+    phoneNumber: row.phone_number,
+    createdAt: row.created_at
+  }));
 }
 
 export async function isBotUserBanned(userId, phoneNumber) {
   const number = normalizePhoneNumber(phoneNumber);
+
   const result = await pool.query(
-    'SELECT 1 FROM bot_bans WHERE owner_user_id = $1 AND phone_number = $2',
+    `SELECT 1
+     FROM bot_bans
+     WHERE owner_user_id = $1 AND phone_number = $2`,
     [userId, number]
   );
+
   return result.rowCount > 0;
 }
 
 export async function banBotUser(userId, phoneNumber) {
   const number = normalizePhoneNumber(phoneNumber);
+
   const result = await pool.query(
-    `INSERT INTO bot_bans (owner_user_id, phone_number) VALUES ($1, $2)
-     ON CONFLICT DO NOTHING RETURNING phone_number`,
+    `INSERT INTO bot_bans (owner_user_id, phone_number)
+     VALUES ($1, $2)
+     ON CONFLICT DO NOTHING
+     RETURNING phone_number`,
     [userId, number]
   );
+
   return result.rowCount > 0;
 }
 
 export async function unbanBotUser(userId, phoneNumber) {
   const number = normalizePhoneNumber(phoneNumber);
+
   const result = await pool.query(
-    'DELETE FROM bot_bans WHERE owner_user_id = $1 AND phone_number = $2 RETURNING phone_number',
+    `DELETE FROM bot_bans
+     WHERE owner_user_id = $1 AND phone_number = $2
+     RETURNING phone_number`,
     [userId, number]
   );
+
   return result.rowCount > 0;
 }
 
 export function getDefaultFeatureSettings() {
-  return { ...DEFAULT_SETTINGS, statusEmojis: [...DEFAULT_SETTINGS.statusEmojis] };
+  return {
+    ...DEFAULT_SETTINGS,
+    statusEmojis: [...DEFAULT_SETTINGS.statusEmojis]
+  };
 }
