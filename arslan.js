@@ -1,7 +1,7 @@
 var commands = [];
 
 function cmd(info, func) {
-    var data = info;
+    var data = info || {};
     data.function = func;
     
     // Si pas de pattern, on utilise cmdname
@@ -13,6 +13,10 @@ function cmd(info, func) {
     if (!data.fromMe) data.fromMe = false;
     if (!data.category) data.category = 'misc';
     
+    if (data.dontAddCommandList) {
+        return data;
+    }
+
     commands.push(data);
     return data;
 }
@@ -23,4 +27,3 @@ module.exports = {
     Function: cmd,
     commands,
 };
-
