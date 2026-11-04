@@ -69,12 +69,8 @@ function formatUptime(totalSeconds) {
   const hours = Math.floor((seconds % 86400) / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
   const remainingSeconds = seconds % 60;
-  return [
-    days ? `${days}d` : null,
-    hours ? `${hours}h` : null,
-    minutes ? `${minutes}m` : null,
-    `${remainingSeconds}s`
-  ].filter(Boolean).join(' ');
+  return [days ? `${days}d` : null, hours ? `${hours}h` : null,
+    minutes ? `${minutes}m` : null, `${remainingSeconds}s`].filter(Boolean).join(' ');
 }
 
 function getGroupAdmins(metadata) {
@@ -131,8 +127,6 @@ export async function handleIncomingMessage(sock, userId, message) {
   const senderJid = selfChat ? normalizeJid(sock.user?.id || sock.user?.lid) :
     (message.key.participant || chatId);
   const senderPhone = phoneFromJid(senderJid);
-
-  // A bot-level ban applies to messages from that number, but never blocks the owner.
   if (!selfChat && senderPhone && await isBotUserBanned(userId, senderPhone)) return;
 
   const settings = await getFeatureSettings(userId);
@@ -141,8 +135,7 @@ export async function handleIncomingMessage(sock, userId, message) {
   const parts = text.slice(prefix.length).trim().split(/\s+/).filter(Boolean);
   const command = (parts.shift() || '').toLowerCase();
   const args = parts;
-  if (!command) return;
-  if (isRateLimited(`${userId}:${senderJid}`)) return;
+  if (!command || isRateLimited(`${userId}:${senderJid}`)) return;
 
   const reply = response => sock.sendMessage(chatId, { text: response }, { quoted: message });
   const ownerOnly = async () => {
