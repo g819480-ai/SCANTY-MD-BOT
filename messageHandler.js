@@ -87,6 +87,7 @@ function menuText() {
     '┃ .autoreact on/off',
     '┃ .setemojis ❤️,🔥,😍',
     '┃ .unban <phone number> (owner self-chat only)',
+    '┃ Note: unban removes a bot-access ban; it does not add anyone to a WhatsApp group.',
     '╰━━━━━━━━━━━━━━━━━━╯'
   ].join('\n');
 }
