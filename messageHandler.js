@@ -107,11 +107,27 @@ export async function handleIncomingMessage(sock, userId, message) {
     if (!chatId || chatId === 'status@broadcast') return;
     if (chatId.endsWith('@newsletter')) return;
 
+    // Recognize the owner's WhatsApp account using its JID or LID.
+    const ownerJids = [
+      sock.user?.id,
+      sock.user?.lid
+    ]
+      .map(normalizeJid)
+      .filter(Boolean);
+
+    const chatJids = [
+      chatId,
+      message.key.remoteJidAlt
+    ]
+      .map(normalizeJid)
+      .filter(Boolean);
+
     const isOwnerSelfChat =
       message.key.fromMe === true &&
-      !chatId.endsWith('@g.us') &&
-      normalizeJid(chatId) === normalizeJid(sock.user?.id);
+      isPrivateChat(chatId) &&
+      chatJids.some(jid => ownerJids.includes(jid));
 
+    // Ignore messages sent by the bot to other chats.
     if (message.key.fromMe && !isOwnerSelfChat) return;
 
     const text = getMessageText(message);
@@ -131,7 +147,7 @@ export async function handleIncomingMessage(sock, userId, message) {
       );
     };
 
-    // Block banned people before processing their commands or messages.
+    // Block banned users, but never block the recognized owner.
     if (!isOwnerSelfChat && !message.key.fromMe) {
       const banned = await isBotUserBanned(userId, senderJid);
       if (banned) return;
@@ -293,7 +309,6 @@ Status emojis: ${(settings.statusEmojis || []).join(' ')}
           return reply('🧹 Your AI conversation memory has been cleared.');
         }
 
-        // Only the bot owner using the bot's own chat can manage bans.
         case 'ban': {
           if (!isOwnerSelfChat) {
             return reply('⛔ Only the bot owner can use this command from the bot self-chat.');
@@ -414,6 +429,7 @@ Status emojis: ${(settings.statusEmojis || []).join(' ')}
     }
 
     // Automatic AI replies are limited to private chats.
+    // Do not let the bot reply to its own messages.
     if (
       settings.aiChatEnabled &&
       isPrivateChat(chatId) &&
