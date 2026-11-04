@@ -1,35 +1,37 @@
 {
-  "name": "scanty-md-bot",
-  "version": "1.0.0",
-  "description": "SCANTY MD BOT - Personal WhatsApp automation platform",
-  "main": "server.js",
-  "type": "module",
+  "name": "scanty md-bot",
+  "version": "2.0.0",
+  "description": "WhatsApp Bot Base",
+  "main": "index.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js",
-    "test": "node --test",
-    "postinstall": "node scripts/patch-baileys-platform.js || true"
+    "start": "node index.js"
   },
   "dependencies": {
-    "@hapi/boom": "^10.0.1",
-    "@whiskeysockets/baileys": "6.7.23",
-    "axios": "^1.7.0",
-    "bcryptjs": "^2.4.3",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "file-type": "^16.5.4",
-    "fluent-ffmpeg": "^2.1.3",
-    "jsonwebtoken": "^9.0.2",
+    "@whiskeysockets/baileys": "^v7.0.0-rc.9",
+    "axios": "latest",
+    "body-parser": "^1.20.2",
+    "cors": "^2.8.5",
+    "dotenv": "latest",
+    "express": "^4.18.2",
     "node-fetch": "^2.7.0",
-    "pg": "^8.13.1",
-    "pino": "^9.0.0",
-    "qrcode-terminal": "^0.12.0"
-  },
-  "devDependencies": {
-    "nodemon": "^3.1.0"
-  },
-  "engines": {
-    "node": ">=20"
-  },
-  "ci_trigger_note": "Trigger pull request checks."
+    "sharp": "^0.32.6",
+    "path": "^0.12.7",
+    "jimp": "1.6.1",
+    "ytdl-core": "^4.11.5",
+    "node-telegram-bot-api": "^0.66.0",
+    "fs-extra": "^11.2.0",
+    "pino": "^8.17.0",
+    "@octokit/rest": "^20.0.2",
+    "child_process": "^1.0.2",
+    "denethdev-ytmp3": "1.0.3",
+    "cheerio": "latest",
+    "ruhend-scraper": "9.0.1",
+    "yt-search": "2.12.1",
+    "fluent-ffmpeg": "^2.1.2",
+    "wa-sticker-formatter": "^4.4.4",
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "file-type": "21.0.0",
+    "mongoose": "^8.0.0",
+    "moment-timezone": "^0.6.0"
+  }
 }
