@@ -4,7 +4,16 @@ import {
 } from './featureSettings.js';
 
 const PREFIX = '.';
+const _lastCmd = new Map();
+const CMD_COOLDOWN_MS = 3000;
 
+function isRateLimited(senderJid) {
+  const now = Date.now();
+  const last = _lastCmd.get(senderJid) || 0;
+  if (now - last < CMD_COOLDOWN_MS) return true;
+  _lastCmd.set(senderJid, now);
+  return false;
+}
 function getMessageText(message) {
   let content = message.message;
   if (!content) return '';
