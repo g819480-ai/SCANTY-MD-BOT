@@ -170,6 +170,8 @@ function isVisitor(user) {
   return Boolean(user && user.is_guest);
 }
 
+const rateLimits = new Map();
+
 function rateLimit(req, res, limit = 20) {
   const key = `${req.socket.remoteAddress}:${req.url}`;
   const now = Date.now();
@@ -191,8 +193,6 @@ function rateLimit(req, res, limit = 20) {
 
   return false;
 }
-
-const rateLimits = new Map();
 
 async function initializeDatabase() {
   await pool.query(`
@@ -402,7 +402,6 @@ async function handleRequest(req, res) {
   }
 
   // PRIVATE VISITOR SESSION CREATION
-  // This creates a temporary pairing identity, not a public account.
 
   if (
     req.method === 'POST' &&
