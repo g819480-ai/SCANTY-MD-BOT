@@ -1,19 +1,16 @@
+
 import {
   getFeatureSettings,
   setFeatureSetting
 } from './featureSettings.js';
 
-const PREFIX = '.';
-const _lastCmd = new Map();
-const CMD_COOLDOWN_MS = 3000;
+import { generateAIReply } from './aiChat.js';
 
-function isRateLimited(senderJid) {
-  const now = Date.now();
-  const last = _lastCmd.get(senderJid) || 0;
-  if (now - last < CMD_COOLDOWN_MS) return true;
-  _lastCmd.set(senderJid, now);
-  return false;
-}
+const aiHistory = new Map();
+const MAX_HISTORY = 10;
+const AI_COOLDOWN_MS = 5000;
+const lastAIReply = new Map();
+
 function getMessageText(message) {
   let content = message.message;
   if (!content) return '';
@@ -34,14 +31,18 @@ function getMessageText(message) {
 }
 
 function getMentionedJids(message) {
-  const context =
-    message.message?.extendedTextMessage?.contextInfo;
+  const content =
+    message.message?.ephemeralMessage?.message ||
+    message.message?.viewOnceMessage?.message ||
+    message.message?.viewOnceMessageV2?.message ||
+    message.message;
 
-  return context?.mentionedJid || [];
+  return content?.extendedTextMessage?.contextInfo?.mentionedJid || [];
 }
 
 function normalizeJid(jid) {
   if (!jid) return '';
+
   const [user, server] = jid.split('@');
   return `${user.split(':')[0]}@${server || ''}`;
 }
@@ -50,14 +51,71 @@ function getParticipantJid(jid) {
   return jid?.split(':')[0];
 }
 
+function isPrivateChat(chatId) {
+  return (
+    chatId?.endsWith('@s.whatsapp.net') ||
+    chatId?.endsWith('@lid')
+  );
+}
+
 async function isGroupAdmin(sock, chatId, senderJid) {
   const metadata = await sock.groupMetadata(chatId);
+
   const participant = metadata.participants.find(
-    p => getParticipantJid(p.id) === getParticipantJid(senderJid)
+    p =>
+      getParticipantJid(p.id) ===
+      getParticipantJid(senderJid)
   );
 
-  return participant?.admin === 'admin' ||
-    participant?.admin === 'superadmin';
+  return (
+    participant?.admin === 'admin' ||
+    participant?.admin === 'superadmin'
+  );
+}
+
+function getHistoryKey(userId, chatId) {
+  return `${userId}:${chatId}`;
+}
+
+async function sendAIReply(sock, chatId, userId, text, personality, message) {
+  const key = getHistoryKey(userId, chatId);
+  const history = aiHistory.get(key) || [];
+
+  const now = Date.now();
+  const last = lastAIReply.get(key) || 0;
+
+  if (now - last < AI_COOLDOWN_MS) {
+    return;
+  }
+
+  lastAIReply.set(key, now);
+
+  try {
+    const answer = await generateAIReply({
+      message: text,
+      personality,
+      history
+    });
+
+    history.push(
+      { role: 'user', content: text },
+      { role: 'assistant', content: answer }
+    );
+
+    aiHistory.set(key, history.slice(-MAX_HISTORY));
+
+    await sock.sendMessage(
+      chatId,
+      { text: answer },
+      message ? { quoted: message } : {}
+    );
+  } catch (error) {
+    console.error('AI reply error:', error.message);
+
+    await sock.sendMessage(chatId, {
+      text: `⚠️ AI error: ${error.message}`
+    });
+  }
 }
 
 export async function handleIncomingMessage(sock, userId, message) {
@@ -69,9 +127,6 @@ export async function handleIncomingMessage(sock, userId, message) {
     if (!chatId || chatId === 'status@broadcast') return;
     if (chatId.endsWith('@newsletter')) return;
 
-    // Permit commands sent in the linked account's own 1:1 self-chat so the
-    // owner can test/control the bot from the linked device. Continue ignoring
-    // messages sent by the bot to other chats to prevent reply loops.
     const isOwnerSelfChat =
       message.key.fromMe === true &&
       !chatId.endsWith('@g.us') &&
@@ -80,73 +135,77 @@ export async function handleIncomingMessage(sock, userId, message) {
     if (message.key.fromMe && !isOwnerSelfChat) return;
 
     const text = getMessageText(message);
-    if (!text.startsWith(PREFIX)) return;
-
-    const parts = text.slice(PREFIX.length).trim().split(/\s+/);
-    const command = (parts.shift() || '').toLowerCase();
-    const args = parts;
-
-    const senderJid =
-      message.key.participant || message.key.remoteJid;
+    if (!text) return;
 
     const settings = await getFeatureSettings(userId);
+    const prefix = settings.prefix || '.';
 
-    const reply = async text => {
-      await sock.sendMessage(chatId, { text }, {
-        quoted: message
-      });
+    const reply = async response => {
+      await sock.sendMessage(
+        chatId,
+        { text: response },
+        { quoted: message }
+      );
     };
 
-    switch (command) {
-      case 'menu':
-      case 'help':
-        return reply(`
+    // Handle commands using the saved prefix.
+    if (text.startsWith(prefix)) {
+      const parts = text.slice(prefix.length).trim().split(/\s+/);
+      const command = (parts.shift() || '').toLowerCase();
+      const args = parts;
+
+      const senderJid =
+        message.key.participant || message.key.remoteJid;
+
+      switch (command) {
+        case 'menu':
+        case 'help':
+          return reply(`
 ╭━━〔 SCANTY MD BOT 〕━━╮
-┃
-┣━━ GENERAL ━━
-┃ .menu
-┃ .ping
-┃ .status
-┃ .settings
-┃
-┣━━ STATUS ━━
-┃ .alwaysonline on/off
-┃ .autoviewstatus on/off
-┃ .statusreact on/off
-┃ .setemojis ❤️,🔥,😍
-┃
-┣━━ GROUP MANAGEMENT ━━
-┃ .antilink on/off
-┃ .welcome on/off
-┃ .goodbye on/off
-┃ .kick @user
-┃ .promote @user
-┃ .demote @user
-┃ .unban @user
-┃
-┣━━ AI & MEDIA ━━
-┃ .ai <question>
-┃ .translate <language> <text>
-┃ .sticker
-┃ .toimg
-┃ .tomp3
-┃ .tts <text>
-┃
-╰━━━━━━━━━━━━━━━━━━╯
+
+GENERAL
+${prefix}menu
+${prefix}ping
+${prefix}status
+${prefix}settings
+${prefix}setprefix !
+
+STATUS
+${prefix}alwaysonline on/off
+${prefix}autoviewstatus on/off
+${prefix}statusreact on/off
+${prefix}setemojis ❤️,🔥,😍
+
+GROUP SETTINGS
+${prefix}antilink on/off
+${prefix}welcome on/off
+${prefix}goodbye on/off
+${prefix}unban @user
+
+AI CHAT
+${prefix}aichat on/off
+${prefix}ai <question>
+${prefix}aipersonality friendly
+${prefix}aipersonality professional
+${prefix}aipersonality funny
+${prefix}aipersonality casual
+${prefix}aiclear
+
+╰━━━━━━━━━━━━━━━━━━━━╯
 
 SCANTY MD BOT
-        `.trim());
+          `.trim());
 
-      case 'ping':
-        return reply('🏓 SCANTY MD BOT is online!');
+        case 'ping':
+          return reply('🏓 SCANTY MD BOT is online!');
 
-      case 'status':
-        return reply(
-          `✅ SCANTY MD BOT is connected.\nAccount: ${sock.user?.id || 'unknown'}\nCommand prefix: ${PREFIX}`
-        );
+        case 'status':
+          return reply(
+            `✅ SCANTY MD BOT is connected.\nAccount: ${sock.user?.id || 'unknown'}\nCommand prefix: ${prefix}`
+          );
 
-      case 'settings':
-        return reply(`
+        case 'settings':
+          return reply(`
 SCANTY MD BOT SETTINGS
 
 Always Online: ${settings.alwaysOnline ? 'ON' : 'OFF'}
@@ -157,106 +216,219 @@ Welcome: ${settings.welcome ? 'ON' : 'OFF'}
 Goodbye: ${settings.goodbye ? 'ON' : 'OFF'}
 Auto React: ${settings.autoReact ? 'ON' : 'OFF'}
 
-Status emojis: ${settings.statusEmojis.join(' ')}
-        `.trim());
+AI Auto Chat: ${settings.aiChatEnabled ? 'ON' : 'OFF'}
+AI Personality: ${settings.aiPersonality}
+Command Prefix: ${prefix}
 
-      case 'alwaysonline':
-      case 'autoviewstatus':
-      case 'statusreact':
-      case 'antilink':
-      case 'welcome':
-      case 'goodbye':
-      case 'autoreact': {
-        const value = args[0]?.toLowerCase();
+Status emojis: ${(settings.statusEmojis || []).join(' ')}
+          `.trim());
 
-        if (!['on', 'off'].includes(value)) {
-          return reply(`Usage: .${command} on/off`);
+        case 'setprefix': {
+          const newPrefix = args[0];
+
+          if (!newPrefix) {
+            return reply(`Current prefix: ${prefix}\nExample: ${prefix}setprefix !`);
+          }
+
+          try {
+            await setFeatureSetting(userId, 'prefix', newPrefix);
+            return reply(`✅ Command prefix changed to: ${newPrefix}`);
+          } catch (error) {
+            return reply(error.message);
+          }
         }
 
-        const settingNames = {
-          alwaysonline: 'alwaysOnline',
-          autoviewstatus: 'autoViewStatus',
-          statusreact: 'statusReact',
-          antilink: 'antiLink',
-          welcome: 'welcome',
-          goodbye: 'goodbye',
-          autoreact: 'autoReact'
-        };
+        case 'aichat': {
+          const value = args[0]?.toLowerCase();
 
-        await setFeatureSetting(
-          userId,
-          settingNames[command],
-          value === 'on'
-        );
+          if (!['on', 'off'].includes(value)) {
+            return reply(`Usage: ${prefix}aichat on/off`);
+          }
 
-        return reply(
-          `✅ ${command} has been turned ${value.toUpperCase()}.`
-        );
-      }
+          await setFeatureSetting(
+            userId,
+            'aiChatEnabled',
+            value === 'on'
+          );
 
-      case 'setemojis': {
-        const emojis = args.join('').split(',').filter(Boolean);
-
-        if (!emojis.length || emojis.length > 10) {
           return reply(
-            'Example: .setemojis ❤️,🔥,😍,😂\nUse between 1 and 10 emojis.'
+            `🤖 Automatic private AI chat is now ${value.toUpperCase()}.`
           );
         }
 
-        await setFeatureSetting(userId, 'statusEmojis', emojis);
+        case 'ai': {
+          if (!isPrivateChat(chatId)) {
+            return reply('🤖 AI questions are available in private chats only.');
+          }
 
-        return reply(`✅ Status emojis saved: ${emojis.join(' ')}`);
+          const question = args.join(' ').trim();
+
+          if (!question) {
+            return reply(`Example: ${prefix}ai Explain artificial intelligence.`);
+          }
+
+          await sendAIReply(
+            sock,
+            chatId,
+            userId,
+            question,
+            settings.aiPersonality,
+            message
+          );
+
+          return;
+        }
+
+        case 'aipersonality': {
+          const personality = args[0]?.toLowerCase();
+
+          const allowed = [
+            'friendly',
+            'professional',
+            'funny',
+            'casual'
+          ];
+
+          if (!allowed.includes(personality)) {
+            return reply(
+              `Choose one: ${allowed.join(', ')}`
+            );
+          }
+
+          await setFeatureSetting(
+            userId,
+            'aiPersonality',
+            personality
+          );
+
+          return reply(`✅ AI personality changed to ${personality}.`);
+        }
+
+        case 'aiclear': {
+          if (!isPrivateChat(chatId)) {
+            return reply('This command works in private chats only.');
+          }
+
+          aiHistory.delete(getHistoryKey(userId, chatId));
+
+          return reply('🧹 Your AI conversation memory has been cleared.');
+        }
+
+        case 'alwaysonline':
+        case 'autoviewstatus':
+        case 'statusreact':
+        case 'antilink':
+        case 'welcome':
+        case 'goodbye':
+        case 'autoreact': {
+          const value = args[0]?.toLowerCase();
+
+          if (!['on', 'off'].includes(value)) {
+            return reply(`Usage: ${prefix}${command} on/off`);
+          }
+
+          const settingNames = {
+            alwaysonline: 'alwaysOnline',
+            autoviewstatus: 'autoViewStatus',
+            statusreact: 'statusReact',
+            antilink: 'antiLink',
+            welcome: 'welcome',
+            goodbye: 'goodbye',
+            autoreact: 'autoReact'
+          };
+
+          await setFeatureSetting(
+            userId,
+            settingNames[command],
+            value === 'on'
+          );
+
+          return reply(
+            `✅ ${command} has been turned ${value.toUpperCase()}.`
+          );
+        }
+
+        case 'setemojis': {
+          const emojis = args.join('').split(',').filter(Boolean);
+
+          if (!emojis.length || emojis.length > 10) {
+            return reply(
+              `Example: ${prefix}setemojis ❤️,🔥,😍,😂\nUse between 1 and 10 emojis.`
+            );
+          }
+
+          await setFeatureSetting(userId, 'statusEmojis', emojis);
+
+          return reply(`✅ Status emojis saved: ${emojis.join(' ')}`);
+        }
+
+        case 'unban': {
+          if (!chatId.endsWith('@g.us')) {
+            return reply('This command only works in groups.');
+          }
+
+          const target = getMentionedJids(message)[0];
+
+          if (!target) {
+            return reply(`Mention the person you want to add back.\nExample: ${prefix}unban @user`);
+          }
+
+          const senderIsAdmin = await isGroupAdmin(
+            sock,
+            chatId,
+            senderJid
+          );
+
+          if (!senderIsAdmin) {
+            return reply('Only group admins can use this command.');
+          }
+
+          const metadata = await sock.groupMetadata(chatId);
+          const botJid = getParticipantJid(sock.user.id);
+
+          const botParticipant = metadata.participants.find(
+            p => getParticipantJid(p.id) === botJid
+          );
+
+          if (
+            botParticipant?.admin !== 'admin' &&
+            botParticipant?.admin !== 'superadmin'
+          ) {
+            return reply('The bot must be a group admin to add participants.');
+          }
+
+          await sock.groupParticipantsUpdate(
+            chatId,
+            [target],
+            'add'
+          );
+
+          return reply(
+            '✅ Add-member request sent. WhatsApp privacy settings may require an invitation instead.'
+          );
+        }
+
+        default:
+          return reply(
+            `Unknown command: ${prefix}${command}\nSend ${prefix}menu to see commands.`
+          );
       }
+    }
 
-      case 'unban': {
-        if (!chatId.endsWith('@g.us')) {
-          return reply('This command only works in groups.');
-        }
-
-        const mentioned = getMentionedJids(message);
-        const target = mentioned[0];
-
-        if (!target) {
-          return reply('Mention the person you want to add back.\nExample: .unban @user');
-        }
-
-        const senderIsAdmin = await isGroupAdmin(
-          sock, chatId, senderJid
-        );
-
-        if (!senderIsAdmin) {
-          return reply('Only group admins can use this command.');
-        }
-
-        const metadata = await sock.groupMetadata(chatId);
-        const botJid = getParticipantJid(sock.user.id);
-
-        const botParticipant = metadata.participants.find(
-          p => getParticipantJid(p.id) === botJid
-        );
-
-        if (
-          botParticipant?.admin !== 'admin' &&
-          botParticipant?.admin !== 'superadmin'
-        ) {
-          return reply('The bot must be a group admin to add participants.');
-        }
-
-        await sock.groupParticipantsUpdate(
-          chatId,
-          [target],
-          'add'
-        );
-
-        return reply(
-          '✅ Add-member request sent. WhatsApp privacy settings may require an invitation instead.'
-        );
-      }
-
-      default:
-        return reply(
-          `Unknown command: .${command}\nSend .menu to see commands.`
-        );
+    // Automatic AI replies: private chats only, never groups or self-messages.
+    if (
+      settings.aiChatEnabled &&
+      isPrivateChat(chatId) &&
+      !message.key.fromMe
+    ) {
+      await sendAIReply(
+        sock,
+        chatId,
+        userId,
+        text,
+        settings.aiPersonality,
+        message
+      );
     }
   } catch (error) {
     console.error('Message handler error:', error.message);
@@ -264,7 +436,9 @@ Status emojis: ${settings.statusEmojis.join(' ')}
     try {
       await sock.sendMessage(
         message.key.remoteJid,
-        { text: '❌ Something went wrong while processing that command.' }
+        {
+          text: '❌ Something went wrong while processing that message.'
+        }
       );
     } catch {
       // Ignore reply failures.
