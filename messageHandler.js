@@ -2,6 +2,8 @@ import {
   getFeatureSettings,
   setFeatureSetting,
   isBotUserBanned,
+  banBotUser,
+  listBotBans,
   unbanBotUser
 } from './featureSettings.js';
 
@@ -61,6 +63,26 @@ function parseEmojis(input) {
   return [...new Set(values)];
 }
 
+function formatUptime(totalSeconds) {
+  const seconds = Math.max(0, Math.floor(totalSeconds));
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainingSeconds = seconds % 60;
+  return [
+    days ? `${days}d` : null,
+    hours ? `${hours}h` : null,
+    minutes ? `${minutes}m` : null,
+    `${remainingSeconds}s`
+  ].filter(Boolean).join(' ');
+}
+
+function getGroupAdmins(metadata) {
+  return (metadata?.participants || [])
+    .filter(participant => participant.admin === 'admin' || participant.admin === 'superadmin')
+    .map(participant => participant.id);
+}
+
 const toggleSettings = Object.freeze({
   alwaysonline: 'alwaysOnline',
   autoviewstatus: 'autoViewStatus',
@@ -77,6 +99,10 @@ function menuText() {
     '┃ .menu / .help',
     '┃ .ping',
     '┃ .status',
+    '┃ .uptime',
+    '┃ .jid',
+    '┃ .groupinfo (groups)',
+    '┃ .admins (groups)',
     '┃ .settings',
     '┃ .alwaysonline on/off',
     '┃ .autoviewstatus on/off',
@@ -86,7 +112,8 @@ function menuText() {
     '┃ .goodbye on/off',
     '┃ .autoreact on/off',
     '┃ .setemojis ❤️,🔥,😍',
-    '┃ .unban <phone number> (owner self-chat only)',
+    '┃ .ban <phone number> (owner self-chat only)',
+    '┃ .bans / .unban <phone number> (owner self-chat only)',
     '┃ Note: unban removes a bot-access ban; it does not add anyone to a WhatsApp group.',
     '╰━━━━━━━━━━━━━━━━━━╯'
   ].join('\n');
@@ -120,7 +147,7 @@ export async function handleIncomingMessage(sock, userId, message) {
   const reply = response => sock.sendMessage(chatId, { text: response }, { quoted: message });
   const ownerOnly = async () => {
     if (selfChat) return true;
-    await reply('Only the bot owner can change these settings. Send the command from the bot account’s own chat.');
+    await reply('Only the bot owner can manage bot settings and access bans. Send the command from the bot account’s own chat.');
     return false;
   };
 
@@ -129,6 +156,28 @@ export async function handleIncomingMessage(sock, userId, message) {
       case 'menu':
       case 'help': return reply(menuText());
       case 'ping': return reply('🏓 SCANTY MD BOT is responding.');
+      case 'uptime': return reply(`⏱️ Bot uptime: ${formatUptime(process.uptime())}`);
+      case 'jid':
+        return reply(`Chat: ${chatId}\nSender: ${senderJid}${message.key.participant ? `\nParticipant: ${message.key.participant}` : ''}`);
+      case 'groupinfo': {
+        if (!chatId.endsWith('@g.us')) return reply('This command only works in a group.');
+        const metadata = await sock.groupMetadata(chatId);
+        const admins = getGroupAdmins(metadata);
+        return reply([
+          `Group: ${metadata.subject || '(unnamed)'}`,
+          `ID: ${metadata.id || chatId}`,
+          `Members: ${metadata.participants?.length || 0}`,
+          `Admins: ${admins.length}`,
+          metadata.desc ? `Description: ${metadata.desc}` : null
+        ].filter(Boolean).join('\n'));
+      }
+      case 'admins': {
+        if (!chatId.endsWith('@g.us')) return reply('This command only works in a group.');
+        const metadata = await sock.groupMetadata(chatId);
+        const admins = getGroupAdmins(metadata);
+        if (!admins.length) return reply('No group admins were returned.');
+        return reply(`Group admins (${admins.length}):\n${admins.map(jid => `• ${jid}`).join('\n')}`);
+      }
       case 'status': {
         const open = sock.ws?.readyState === (sock.ws?.OPEN ?? 1) && Boolean(sock.user);
         return reply(`${open ? '✅ Connected' : '⚠️ Not connected'}\nAccount: ${sock.user?.id || 'unknown'}\nPrefix: ${prefix}`);
@@ -153,6 +202,19 @@ export async function handleIncomingMessage(sock, userId, message) {
         await setFeatureSetting(userId, 'statusEmojis', emojis);
         return reply(`✅ Status emojis saved: ${emojis.join(' ')}`);
       }
+      case 'ban': {
+        if (!(await ownerOnly())) return;
+        const target = args[0];
+        if (!target) return reply('Usage: .ban <phone number> (include country code)');
+        const added = await banBotUser(userId, target);
+        return reply(added ? '✅ Number banned from using this bot.' : 'That number is already banned from this bot.');
+      }
+      case 'bans': {
+        if (!(await ownerOnly())) return;
+        const bans = await listBotBans(userId);
+        if (!bans.length) return reply('There are no numbers banned from this bot.');
+        return reply(`Bot access bans (${bans.length}):\n${bans.map(ban => `• ${ban.phoneNumber}`).join('\n')}`);
+      }
       case 'unban': {
         if (!(await ownerOnly())) return;
         const mention = message.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
@@ -173,8 +235,15 @@ export async function handleIncomingMessage(sock, userId, message) {
     }
   } catch (error) {
     console.error('Message handler error:', error.message);
-    try { await reply('❌ Could not complete that command. Check the bot service logs.'); } catch { /* socket may have closed */ }
+    try { await reply(`❌ ${error.message || 'Could not complete that command.'}`); } catch { /* socket may have closed */ }
   }
 }
 
-export const messageHandlerInternals = Object.freeze({ getMessageText, isOwnerSelfChat, parseEmojis, menuText });
+export const messageHandlerInternals = Object.freeze({
+  getMessageText,
+  isOwnerSelfChat,
+  parseEmojis,
+  formatUptime,
+  getGroupAdmins,
+  menuText
+});
