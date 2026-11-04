@@ -1,20 +1,11 @@
+import { STATUS_EMOJIS } from './featureSettings.js';
 
-import { config } from './config.js';
+// Legacy helper retained for compatibility.
+// The active per-user status handling is in statusEvents.js.
+export function getStatusReaction() {
+  if (!STATUS_EMOJIS.length) return null;
 
-export function getStatusReaction(contactNumber) {
-  if (!config.reactionSettings.enabled) {
-    return null;
-  }
-
-  if (!config.allowedContacts.includes(contactNumber)) {
-    return null;
-  }
-
-  const emojis = config.reactionSettings.emojis;
-
-  if (!emojis.length) {
-    return null;
-  }
-
-  return emojis[Math.floor(Math.random() * emojis.length)];
+  return STATUS_EMOJIS[
+    Math.floor(Math.random() * STATUS_EMOJIS.length)
+  ];
 }
