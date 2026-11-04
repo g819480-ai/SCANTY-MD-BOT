@@ -24,6 +24,7 @@ import {
 } from './whatsappLifecycle.js';
 
 const { Pool } = pg;
+
 const sessions = new Map();
 const sessionStatus = new Map();
 const presenceTimers = new Map();
@@ -35,7 +36,9 @@ const reconnectContexts = new Map();
 const secret = process.env.SESSION_ENCRYPTION_KEY?.trim();
 
 if (!secret || secret.length < 64) {
-  throw new Error('SESSION_ENCRYPTION_KEY must exist and contain at least 64 characters.');
+  throw new Error(
+    'SESSION_ENCRYPTION_KEY must exist and contain at least 64 characters.'
+  );
 }
 
 if (!process.env.DATABASE_URL) {
@@ -48,7 +51,8 @@ const pool = new Pool({
   max: 5
 });
 
-const encryptionKey = crypto.createHash('sha256')
+const encryptionKey = crypto
+  .createHash('sha256')
   .update(secret, 'utf8')
   .digest();
 
@@ -75,7 +79,12 @@ function normalizeQrValue(qr) {
 
 function encrypt(value) {
   const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', encryptionKey, iv);
+
+  const cipher = crypto.createCipheriv(
+    'aes-256-gcm',
+    encryptionKey,
+    iv
+  );
 
   const encrypted = Buffer.concat([
     cipher.update(value, 'utf8'),
@@ -117,6 +126,7 @@ async function saveRecord(userId, type, id, value) {
        WHERE user_id=$1 AND record_type=$2 AND record_id=$3`,
       [userId, type, id]
     );
+
     return;
   }
 
@@ -160,15 +170,18 @@ function makeAuthState(userId, creds) {
       get: async (type, ids) => {
         const values = {};
 
-        await Promise.all(ids.map(async id => {
-          let value = await readRecord(userId, type, id);
+        await Promise.all(
+          ids.map(async id => {
+            let value = await readRecord(userId, type, id);
 
-          if (type === 'app-state-sync-key' && value) {
-            value = proto.Message.AppStateSyncKeyData.fromObject(value);
-          }
+            if (type === 'app-state-sync-key' && value) {
+              value =
+                proto.Message.AppStateSyncKeyData.fromObject(value);
+            }
 
-          if (value) values[id] = value;
-        }));
+            if (value) values[id] = value;
+          })
+        );
 
         return values;
       },
@@ -205,12 +218,16 @@ async function updatePresence(userId, sock) {
       settings.alwaysOnline ? 'available' : 'unavailable'
     );
   } catch (error) {
-    console.error(`Presence update failed for ${userId}:`, error.message);
+    console.error(
+      `Presence update failed for ${userId}:`,
+      error.message
+    );
   }
 }
 
 function startPresenceHeartbeat(userId, sock) {
   stopPresenceHeartbeat(userId);
+
   updatePresence(userId, sock);
 
   const timer = setInterval(() => {
@@ -238,7 +255,9 @@ async function sendScantyWelcome(userId, sock) {
     const linkedJid = sock.user?.id;
 
     if (!linkedJid) {
-      throw new Error('Could not determine the connected WhatsApp account.');
+      throw new Error(
+        'Could not determine the connected WhatsApp account.'
+      );
     }
 
     const ownJid = linkedJid.endsWith('@s.whatsapp.net')
@@ -264,11 +283,21 @@ async function sendScantyWelcome(userId, sock) {
         '━━━━━━━━━━━━━━━━'
     });
 
-    await saveRecord(userId, 'meta', 'welcome_notice_sent', true);
+    await saveRecord(
+      userId,
+      'meta',
+      'welcome_notice_sent',
+      true
+    );
 
-    console.log(`SCANTY MD welcome sequence sent for ${userId}`);
+    console.log(
+      `SCANTY MD welcome sequence sent for ${userId}`
+    );
   } catch (error) {
-    console.error('SCANTY MD welcome sequence failed:', error.message);
+    console.error(
+      'SCANTY MD welcome sequence failed:',
+      error.message
+    );
   }
 }
 
@@ -284,7 +313,10 @@ function getReconnectController(userId, state, captureQr) {
     maxAttempts: 10,
 
     onState: status => {
-      if (status === 'reconnecting' || status === 'disconnected') {
+      if (
+        status === 'reconnecting' ||
+        status === 'disconnected'
+      ) {
         sessionStatus.set(userId, status);
       }
     },
@@ -317,13 +349,15 @@ function getReconnectController(userId, state, captureQr) {
       await reconnectIfCurrent({
         currentSocket: sessions.get(userId),
         expectedSocket,
-        reconnect: () => attachSocket(
-          userId,
-          context.state,
-          context.captureQr,
-          controller,
-          expectedSocket
-        )
+
+        reconnect: () =>
+          attachSocket(
+            userId,
+            context.state,
+            context.captureQr,
+            controller,
+            expectedSocket
+          )
       });
     }
   });
@@ -347,11 +381,15 @@ async function attachSocket(
   suppliedController = null,
   expectedSocket = null
 ) {
-  if (expectedSocket && sessions.get(userId) !== expectedSocket) {
+  if (
+    expectedSocket &&
+    sessions.get(userId) !== expectedSocket
+  ) {
     return null;
   }
 
-  const controller = suppliedController ||
+  const controller =
+    suppliedController ||
     getReconnectController(userId, state, captureQr);
 
   const context = reconnectContexts.get(userId);
@@ -361,14 +399,18 @@ async function attachSocket(
     state,
     captureQr,
     controller,
-    expectedSocket: expectedSocket || context?.expectedSocket || null
+    expectedSocket:
+      expectedSocket || context?.expectedSocket || null
   });
 
   console.log('Fetching the latest WhatsApp Web version...');
 
   const { version } = await fetchLatestBaileysVersion();
 
-  if (expectedSocket && sessions.get(userId) !== expectedSocket) {
+  if (
+    expectedSocket &&
+    sessions.get(userId) !== expectedSocket
+  ) {
     return null;
   }
 
@@ -387,7 +429,10 @@ async function attachSocket(
     connectTimeoutMs: 30000
   });
 
-  if (expectedSocket && sessions.get(userId) !== expectedSocket) {
+  if (
+    expectedSocket &&
+    sessions.get(userId) !== expectedSocket
+  ) {
     try {
       sock.end(new Error('Superseded reconnect socket.'));
     } catch {}
@@ -408,41 +453,35 @@ async function attachSocket(
 
   sock.ev.on('creds.update', async () => {
     try {
-      await saveRecord(userId, 'creds', 'main', state.creds);
-    } catch (error) {
-      console.error('Could not save credentials:', error.message);
-    }
-  });
-
-sock.ev.on('messages.upsert', async ({ messages, type }) => {
-  console.log('WHATSAPP MESSAGE EVENT:', {
-    type,
-    count: messages?.length || 0
-  });
-
-  if (type !== 'notify' && type !== 'append') return;
-
-  for (const message of messages || []) {
-    try {
-      // Append events are used here only for messages sent by this account.
-      if (type === 'append' && !message.key?.fromMe) continue;
-
-      if (message.key?.remoteJid === 'status@broadcast') {
-        await handleStatusUpdate(sock, userId, message);
-      } else {
-        await handleIncomingMessage(sock, userId, message);
-      }
+      await saveRecord(
+        userId,
+        'creds',
+        'main',
+        state.creds
+      );
     } catch (error) {
       console.error(
-        'Incoming message processing failed:',
+        'Could not save credentials:',
         error.message
       );
     }
-  }
-});
+  });
 
-    for (const message of messages) {
+  // Handle both incoming notifications and outgoing self-chat messages.
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    console.log('WHATSAPP MESSAGE EVENT:', {
+      type,
+      count: messages?.length || 0
+    });
+
+    if (type !== 'notify' && type !== 'append') return;
+
+    for (const message of messages || []) {
       try {
+        if (type === 'append' && !message.key?.fromMe) {
+          continue;
+        }
+
         if (message.key?.remoteJid === 'status@broadcast') {
           await handleStatusUpdate(sock, userId, message);
         } else {
@@ -464,7 +503,8 @@ sock.ev.on('messages.upsert', async ({ messages, type }) => {
   }) => {
     if (sessions.get(userId) !== sock) return;
 
-    const statusCode = lastDisconnect?.error?.output?.statusCode;
+    const statusCode =
+      lastDisconnect?.error?.output?.statusCode;
 
     if (captureQr && qr) {
       qrStates.set(userId, {
@@ -486,7 +526,9 @@ sock.ev.on('messages.upsert', async ({ messages, type }) => {
         });
       }
 
-      console.log(`WhatsApp connected for user ${userId}`);
+      console.log(
+        `WhatsApp connected for user ${userId}`
+      );
 
       await sendScantyWelcome(userId, sock);
       startPresenceHeartbeat(userId, sock);
@@ -554,7 +596,6 @@ export async function initializeSessionStorage() {
   `);
 }
 
-/* Improved session restore diagnostics */
 export async function restoreUserSessions() {
   const result = await pool.query(
     `SELECT DISTINCT user_id
@@ -575,14 +616,22 @@ export async function restoreUserSessions() {
     if (sessions.has(userId)) continue;
 
     try {
-      const creds = await readRecord(userId, 'creds', 'main');
+      const creds = await readRecord(
+        userId,
+        'creds',
+        'main'
+      );
 
       if (!creds?.registered) {
         unregistered++;
         continue;
       }
 
-      await attachSocket(userId, makeAuthState(userId, creds));
+      await attachSocket(
+        userId,
+        makeAuthState(userId, creds)
+      );
+
       restored++;
     } catch (error) {
       failed++;
@@ -626,33 +675,45 @@ export function getUserQrState(userId) {
 }
 
 export async function startUserQrSession(userId) {
-  return withPairingLock(pairingLocks, userId, async () => {
-    if (!/^[a-f0-9-]{16,64}$/i.test(userId)) {
-      throw new Error('Invalid user ID.');
+  return withPairingLock(
+    pairingLocks,
+    userId,
+    async () => {
+      if (!/^[a-f0-9-]{16,64}$/i.test(userId)) {
+        throw new Error('Invalid user ID.');
+      }
+
+      if (sessions.has(userId)) {
+        throw new Error(
+          'A WhatsApp session is already active for this user.'
+        );
+      }
+
+      const savedCreds = await readRecord(
+        userId,
+        'creds',
+        'main'
+      );
+
+      if (savedCreds?.registered) {
+        throw new Error(
+          'This WhatsApp account is already linked.'
+        );
+      }
+
+      const state = makeAuthState(userId, savedCreds);
+
+      qrStates.set(userId, {
+        qr: null,
+        status: 'connecting',
+        updatedAt: Date.now()
+      });
+
+      await attachSocket(userId, state, true);
+
+      return { started: true };
     }
-
-    if (sessions.has(userId)) {
-      throw new Error('A WhatsApp session is already active for this user.');
-    }
-
-    const savedCreds = await readRecord(userId, 'creds', 'main');
-
-    if (savedCreds?.registered) {
-      throw new Error('This WhatsApp account is already linked.');
-    }
-
-    const state = makeAuthState(userId, savedCreds);
-
-    qrStates.set(userId, {
-      qr: null,
-      status: 'connecting',
-      updatedAt: Date.now()
-    });
-
-    await attachSocket(userId, state, true);
-
-    return { started: true };
-  });
+  );
 }
 
 export async function startUserSession(
@@ -660,87 +721,110 @@ export async function startUserSession(
   phoneNumber,
   onPairingCode
 ) {
-  return withPairingLock(pairingLocks, userId, async () => {
-    if (!/^[a-f0-9-]{16,64}$/i.test(userId)) {
-      throw new Error('Invalid user ID.');
-    }
+  return withPairingLock(
+    pairingLocks,
+    userId,
+    async () => {
+      if (!/^[a-f0-9-]{16,64}$/i.test(userId)) {
+        throw new Error('Invalid user ID.');
+      }
 
-    if (!/^\d{10,15}$/.test(phoneNumber)) {
-      throw new Error(
-        'Enter your country code and phone number using digits only.'
+      if (!/^\d{10,15}$/.test(phoneNumber)) {
+        throw new Error(
+          'Enter your country code and phone number using digits only.'
+        );
+      }
+
+      if (sessions.has(userId)) {
+        throw new Error(
+          'A WhatsApp session is already active for this user.'
+        );
+      }
+
+      const savedCreds = await readRecord(
+        userId,
+        'creds',
+        'main'
       );
-    }
 
-    if (sessions.has(userId)) {
-      throw new Error('A WhatsApp session is already active for this user.');
-    }
-
-    const savedCreds = await readRecord(userId, 'creds', 'main');
-
-    if (savedCreds?.registered) {
-      throw new Error('This WhatsApp account is already linked.');
-    }
-
-    qrStates.delete(userId);
-
-    const state = makeAuthState(userId, savedCreds);
-    const sock = await attachSocket(userId, state);
-
-    try {
-      if (!sock) {
-        throw new Error('WhatsApp socket was superseded before pairing.');
+      if (savedCreds?.registered) {
+        throw new Error(
+          'This WhatsApp account is already linked.'
+        );
       }
 
-      await waitForSocketReady(sock);
+      qrStates.delete(userId);
 
-      if (
-        sessions.get(userId) !== sock ||
-        sessionStatus.get(userId) === 'disconnected'
-      ) {
-        throw new Error('WhatsApp socket closed before pairing.');
-      }
-
-      const code = await sock.requestPairingCode(phoneNumber);
-
-      if (typeof onPairingCode === 'function') {
-        onPairingCode(code);
-      }
-
-      return { started: true };
-    } catch (error) {
-      stopPresenceHeartbeat(userId);
-
-      const activeController = reconnectControllers.get(userId);
-      activeController?.stop();
-
-      if (reconnectControllers.get(userId) === activeController) {
-        reconnectControllers.delete(userId);
-      }
-
-      const activeContext = reconnectContexts.get(userId);
-
-      if (activeContext?.controller === activeController) {
-        reconnectContexts.delete(userId);
-      }
-
-      if (sessions.get(userId) === sock) {
-        sessions.delete(userId);
-      }
-
-      sessionStatus.set(userId, 'disconnected');
+      const state = makeAuthState(userId, savedCreds);
+      const sock = await attachSocket(userId, state);
 
       try {
-        sock?.end(error);
-      } catch {
-        // Socket may already be closed.
+        if (!sock) {
+          throw new Error(
+            'WhatsApp socket was superseded before pairing.'
+          );
+        }
+
+        await waitForSocketReady(sock);
+
+        if (
+          sessions.get(userId) !== sock ||
+          sessionStatus.get(userId) === 'disconnected'
+        ) {
+          throw new Error(
+            'WhatsApp socket closed before pairing.'
+          );
+        }
+
+        const code = await sock.requestPairingCode(
+          phoneNumber
+        );
+
+        if (typeof onPairingCode === 'function') {
+          onPairingCode(code);
+        }
+
+        return { started: true };
+      } catch (error) {
+        stopPresenceHeartbeat(userId);
+
+        const activeController =
+          reconnectControllers.get(userId);
+
+        activeController?.stop();
+
+        if (
+          reconnectControllers.get(userId) === activeController
+        ) {
+          reconnectControllers.delete(userId);
+        }
+
+        const activeContext =
+          reconnectContexts.get(userId);
+
+        if (activeContext?.controller === activeController) {
+          reconnectContexts.delete(userId);
+        }
+
+        if (sessions.get(userId) === sock) {
+          sessions.delete(userId);
+        }
+
+        sessionStatus.set(userId, 'disconnected');
+
+        try {
+          sock?.end(error);
+        } catch {
+          // Socket may already be closed.
+        }
+
+        console.error('PAIRING REQUEST FAILED:', {
+          userId,
+          message: error.message
+        });
+
+        throw error;
       }
-
-      console.error('PAIRING REQUEST FAILED:', {
-        userId,
-        message: error.message
-      });
-
-      throw error;
     }
-  });
+  );
 }
