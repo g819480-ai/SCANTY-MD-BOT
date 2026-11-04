@@ -1,3 +1,4 @@
+
 import {
   getFeatureSettings,
   setFeatureSetting
@@ -7,57 +8,99 @@ const PREFIX = '.';
 const _lastCmd = new Map();
 const CMD_COOLDOWN_MS = 3000;
 
-function isRateLimited(senderJid) {
-  const now = Date.now();
-  const last = _lastCmd.get(senderJid) || 0;
-  if (now - last < CMD_COOLDOWN_MS) return true;
-  _lastCmd.set(senderJid, now);
-  return false;
+function normalizeJid(jid) {
+  if (!jid || typeof jid !== 'string') return '';
+
+  const [user, server] = jid.split('@');
+
+  if (!user || !server) return '';
+
+  return `${user.split(':')[0]}@${server}`;
 }
+
 function getMessageText(message) {
-  let content = message.message;
+  let content = message?.message;
+
   if (!content) return '';
 
-  content =
-    content.ephemeralMessage?.message ||
-    content.viewOnceMessage?.message ||
-    content.viewOnceMessageV2?.message ||
-    content;
+  // Unwrap WhatsApp message wrappers.
+  for (let i = 0; i < 6; i++) {
+    const wrapped =
+      content.ephemeralMessage?.message ||
+      content.viewOnceMessage?.message ||
+      content.viewOnceMessageV2?.message ||
+      content.viewOnceMessageV2Extension?.message ||
+      content.documentWithCaptionMessage?.message;
+
+    if (!wrapped) break;
+
+    content = wrapped;
+  }
 
   return (
     content.conversation ||
     content.extendedTextMessage?.text ||
     content.imageMessage?.caption ||
     content.videoMessage?.caption ||
+    content.documentMessage?.caption ||
     ''
   ).trim();
 }
 
 function getMentionedJids(message) {
-  const context =
-    message.message?.extendedTextMessage?.contextInfo;
-
-  return context?.mentionedJid || [];
-}
-
-function normalizeJid(jid) {
-  if (!jid) return '';
-  const [user, server] = jid.split('@');
-  return `${user.split(':')[0]}@${server || ''}`;
+  return (
+    message.message?.extendedTextMessage?.contextInfo?.mentionedJid ||
+    []
+  );
 }
 
 function getParticipantJid(jid) {
   return jid?.split(':')[0];
 }
 
+function isRateLimited(senderJid) {
+  const now = Date.now();
+  const last = _lastCmd.get(senderJid) || 0;
+
+  if (now - last < CMD_COOLDOWN_MS) return true;
+
+  _lastCmd.set(senderJid, now);
+  return false;
+}
+
+function isOwnerSelfChat(sock, message, chatId) {
+  if (!message.key?.fromMe) return false;
+  if (!chatId || chatId.endsWith('@g.us')) return false;
+  if (
+    chatId.endsWith('@newsletter') ||
+    chatId === 'status@broadcast'
+  ) return false;
+
+  const ownIds = [
+    sock.user?.id,
+    sock.user?.lid
+  ]
+    .map(normalizeJid)
+    .filter(Boolean);
+
+  const chat = normalizeJid(chatId);
+
+  return ownIds.includes(chat);
+}
+
 async function isGroupAdmin(sock, chatId, senderJid) {
   const metadata = await sock.groupMetadata(chatId);
+
   const participant = metadata.participants.find(
-    p => getParticipantJid(p.id) === getParticipantJid(senderJid)
+    p =>
+      getParticipantJid(p.id) ===
+      getParticipantJid(senderJid)
   );
 
-  return participant?.admin === 'admin' ||
-    participant?.admin === 'superadmin';
+  return (
+    participant?.admin === 'admin' ||
+    participant?.admin === 'superadmin'
+  );
 }
 
 export async function handleIncomingMessage(sock, userId, message) {
@@ -69,33 +112,53 @@ export async function handleIncomingMessage(sock, userId, message) {
     if (!chatId || chatId === 'status@broadcast') return;
     if (chatId.endsWith('@newsletter')) return;
 
-    // Permit commands sent in the linked account's own 1:1 self-chat so the
-    // owner can test/control the bot from the linked device. Continue ignoring
-    // messages sent by the bot to other chats to prevent reply loops.
-    const isOwnerSelfChat =
-      message.key.fromMe === true &&
-      !chatId.endsWith('@g.us') &&
-      normalizeJid(chatId) === normalizeJid(sock.user?.id);
+    const selfChat = isOwnerSelfChat(sock, message, chatId);
 
-    if (message.key.fromMe && !isOwnerSelfChat) return;
+    // Ignore messages sent by the bot to other chats.
+    // Allow commands sent by the owner in their own private chat.
+    if (message.key.fromMe && !selfChat) return;
 
     const text = getMessageText(message);
-    if (!text.startsWith(PREFIX)) return;
 
-    const parts = text.slice(PREFIX.length).trim().split(/\s+/);
+    if (!text || !text.startsWith(PREFIX)) return;
+
+    const parts = text
+      .slice(PREFIX.length)
+      .trim()
+      .split(/\s+/);
+
     const command = (parts.shift() || '').toLowerCase();
     const args = parts;
 
-    const senderJid =
-      message.key.participant || message.key.remoteJid;
+    if (!command) return;
+
+    const senderJid = selfChat
+      ? normalizeJid(sock.user?.id || sock.user?.lid)
+      : (
+          message.key.participant ||
+          message.key.remoteJid
+        );
+
+    const rateLimitKey = `${userId}:${senderJid}`;
+
+    if (isRateLimited(rateLimitKey)) return;
 
     const settings = await getFeatureSettings(userId);
 
-    const reply = async text => {
-      await sock.sendMessage(chatId, { text }, {
-        quoted: message
-      });
+    const reply = async responseText => {
+      await sock.sendMessage(
+        chatId,
+        { text: responseText },
+        { quoted: message }
+      );
     };
+
+    console.log('SCANTY COMMAND RECEIVED:', {
+      command,
+      selfChat,
+      fromMe: message.key.fromMe,
+      chatType: chatId.split('@')[1]
+    });
 
     switch (command) {
       case 'menu':
@@ -119,9 +182,6 @@ export async function handleIncomingMessage(sock, userId, message) {
 ┃ .antilink on/off
 ┃ .welcome on/off
 ┃ .goodbye on/off
-┃ .kick @user
-┃ .promote @user
-┃ .demote @user
 ┃ .unban @user
 ┃
 ┣━━ AI & MEDIA ━━
@@ -195,7 +255,10 @@ Status emojis: ${settings.statusEmojis.join(' ')}
       }
 
       case 'setemojis': {
-        const emojis = args.join('').split(',').filter(Boolean);
+        const emojis = args
+          .join('')
+          .split(',')
+          .filter(Boolean);
 
         if (!emojis.length || emojis.length > 10) {
           return reply(
@@ -203,9 +266,15 @@ Status emojis: ${settings.statusEmojis.join(' ')}
           );
         }
 
-        await setFeatureSetting(userId, 'statusEmojis', emojis);
+        await setFeatureSetting(
+          userId,
+          'statusEmojis',
+          emojis
+        );
 
-        return reply(`✅ Status emojis saved: ${emojis.join(' ')}`);
+        return reply(
+          `✅ Status emojis saved: ${emojis.join(' ')}`
+        );
       }
 
       case 'unban': {
@@ -217,15 +286,21 @@ Status emojis: ${settings.statusEmojis.join(' ')}
         const target = mentioned[0];
 
         if (!target) {
-          return reply('Mention the person you want to add back.\nExample: .unban @user');
+          return reply(
+            'Mention the person you want to add back.\nExample: .unban @user'
+          );
         }
 
         const senderIsAdmin = await isGroupAdmin(
-          sock, chatId, senderJid
+          sock,
+          chatId,
+          senderJid
         );
 
         if (!senderIsAdmin) {
-          return reply('Only group admins can use this command.');
+          return reply(
+            'Only group admins can use this command.'
+          );
         }
 
         const metadata = await sock.groupMetadata(chatId);
@@ -239,7 +314,9 @@ Status emojis: ${settings.statusEmojis.join(' ')}
           botParticipant?.admin !== 'admin' &&
           botParticipant?.admin !== 'superadmin'
         ) {
-          return reply('The bot must be a group admin to add participants.');
+          return reply(
+            'The bot must be a group admin to add participants.'
+          );
         }
 
         await sock.groupParticipantsUpdate(
@@ -259,12 +336,18 @@ Status emojis: ${settings.statusEmojis.join(' ')}
         );
     }
   } catch (error) {
-    console.error('Message handler error:', error.message);
+    console.error(
+      'Message handler error:',
+      error.message
+    );
 
     try {
       await sock.sendMessage(
         message.key.remoteJid,
-        { text: '❌ Something went wrong while processing that command.' }
+        {
+          text:
+            '❌ Something went wrong while processing that command.'
+        }
       );
     } catch {
       // Ignore reply failures.
