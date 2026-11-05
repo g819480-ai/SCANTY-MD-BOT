@@ -11,10 +11,10 @@
   "scripts": {
     "start": "node server.js",
     "test": "node --test tests/*.test.js",
-    "check": "node --check server.js && node --check sessionManager.js && node --check whatsappLifecycle.js && node --check messageHandler.js && node --check featureSettings.js && node --check statusEvents.js"
+    "check": "node --check server.js && node --check sessionManager.js && node --check whatsappLifecycle.js && node --check messageHandler.js && node --check featureSettings.js && node --check statusEvents.js && node --check auth.js && node --check database.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "7.0.0-rc.9",
+    "@whiskeysockets/baileys": "7.0.0-rc.12",
     "bcryptjs": "^2.4.3",
     "dotenv": "^16.4.7",
     "jsonwebtoken": "^9.0.2",
