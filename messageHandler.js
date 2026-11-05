@@ -1,3 +1,4 @@
+
 import {
   getFeatureSettings,
   setFeatureSetting,
@@ -21,15 +22,18 @@ function normalizeJid(jid) {
 
 function getMessageText(message) {
   let content = message?.message;
+
   for (let i = 0; content && i < 6; i += 1) {
     const wrapped = content.ephemeralMessage?.message ||
       content.viewOnceMessage?.message ||
       content.viewOnceMessageV2?.message ||
       content.viewOnceMessageV2Extension?.message ||
       content.documentWithCaptionMessage?.message;
+
     if (!wrapped) break;
     content = wrapped;
   }
+
   return String(
     content?.conversation ||
     content?.extendedTextMessage?.text ||
@@ -70,6 +74,7 @@ function isRateLimited(key) {
       if (now - timestamp > COMMAND_COOLDOWN_MS) {
         lastCommands.delete(entry);
       }
+
       if (lastCommands.size <= MAX_RATE_LIMIT_ENTRIES) break;
     }
   }
@@ -224,7 +229,6 @@ export async function handleIncomingMessage(sock, userId, message, dependencies 
 
   if (!command || isRateLimited(`${userId}:${senderJid}`)) return;
 
-  // Log only command identifiers; never log message text, chat IDs, or credentials.
   console.info('WHATSAPP COMMAND RECEIVED:', { command });
 
   const reply = response =>
@@ -248,18 +252,18 @@ export async function handleIncomingMessage(sock, userId, message, dependencies 
     switch (command) {
       case 'menu':
       case 'help':
-        return reply(menuText());
+        return await reply(menuText());
 
       case 'ping':
-        return reply('🏓 SCANTY MD BOT is responding.');
+        return await reply('🏓 SCANTY MD BOT is responding.');
 
       case 'uptime':
-        return reply(
+        return await reply(
           `⏱️ Bot uptime: ${formatUptime(process.uptime())}`
         );
 
       case 'jid':
-        return reply(
+        return await reply(
           `Chat: ${chatId}\nSender: ${senderJid}${
             message.key.participant
               ? `\nParticipant: ${message.key.participant}`
@@ -269,13 +273,13 @@ export async function handleIncomingMessage(sock, userId, message, dependencies 
 
       case 'groupinfo': {
         if (!chatId.endsWith('@g.us')) {
-          return reply('This command only works in a group.');
+          return await reply('This command only works in a group.');
         }
 
         const metadata = await sock.groupMetadata(chatId);
         const admins = getGroupAdmins(metadata);
 
-        return reply([
+        return await reply([
           `Group: ${metadata.subject || '(unnamed)'}`,
           `ID: ${metadata.id || chatId}`,
           `Members: ${metadata.participants?.length || 0}`,
@@ -286,17 +290,17 @@ export async function handleIncomingMessage(sock, userId, message, dependencies 
 
       case 'admins': {
         if (!chatId.endsWith('@g.us')) {
-          return reply('This command only works in a group.');
+          return await reply('This command only works in a group.');
         }
 
         const metadata = await sock.groupMetadata(chatId);
         const admins = getGroupAdmins(metadata);
 
         if (!admins.length) {
-          return reply('No group admins were returned.');
+          return await reply('No group admins were returned.');
         }
 
-        return reply(
+        return await reply(
           `Group admins (${admins.length}):\n${admins
             .map(jid => `• ${jid}`)
             .join('\n')}`
@@ -306,7 +310,7 @@ export async function handleIncomingMessage(sock, userId, message, dependencies 
       case 'status': {
         const connected = isSocketOpen(sock.ws) && Boolean(sock.user?.id || sock.user?.lid);
 
-        return reply(
+        return await reply(
           `${connected ? '✅ Connected' : '⚠️ Not connected'}\nAccount: ${
             sock.user?.id || sock.user?.lid || 'unknown'
           }\nPrefix: ${prefix}`
@@ -314,7 +318,7 @@ export async function handleIncomingMessage(sock, userId, message, dependencies 
       }
 
       case 'settings':
-        return reply([
+        return await reply([
           'SCANTY MD BOT SETTINGS',
           `Always Online: ${settings.alwaysOnline ? 'ON' : 'OFF'}`,
           `Auto View Status: ${settings.autoViewStatus ? 'ON' : 'OFF'}`,
@@ -333,14 +337,14 @@ export async function handleIncomingMessage(sock, userId, message, dependencies 
         const emojis = parseEmojis(args.join(''));
 
         if (!emojis) {
-          return reply(
+          return await reply(
             'Usage: .setemojis ❤️,🔥,😍,😂 (1–10 emoji values)'
           );
         }
 
         await setFeatureSetting(userId, 'statusEmojis', emojis);
 
-        return reply(
+        return await reply(
           `✅ Status emojis saved: ${emojis.join(' ')}`
         );
       }
@@ -351,14 +355,14 @@ export async function handleIncomingMessage(sock, userId, message, dependencies 
         const target = args[0];
 
         if (!target) {
-          return reply(
+          return await reply(
             'Usage: .ban <phone number> (include country code)'
           );
         }
 
         const added = await banBotUser(userId, target);
 
-        return reply(
+        return await reply(
           added
             ? '✅ Number banned from using this bot.'
             : 'That number is already banned from this bot.'
@@ -371,10 +375,10 @@ export async function handleIncomingMessage(sock, userId, message, dependencies 
         const bans = await listBotBans(userId);
 
         if (!bans.length) {
-          return reply('There are no numbers banned from this bot.');
+          return await reply('There are no numbers banned from this bot.');
         }
 
-        return reply(
+        return await reply(
           `Bot access bans (${bans.length}):\n${bans
             .map(ban => `• ${ban.phoneNumber}`)
             .join('\n')}`
@@ -391,14 +395,14 @@ export async function handleIncomingMessage(sock, userId, message, dependencies 
         const target = args[0] || phoneFromJid(mention);
 
         if (!target) {
-          return reply(
+          return await reply(
             'Usage: .unban <phone number>\nThis removes a bot-access ban; it does not add anyone to a WhatsApp group.'
           );
         }
 
         const removed = await unbanBotUser(userId, target);
 
-        return reply(
+        return await reply(
           removed
             ? '✅ Number unbanned from this bot.'
             : 'That number was not on this bot’s ban list.'
@@ -412,7 +416,7 @@ export async function handleIncomingMessage(sock, userId, message, dependencies 
           const value = args[0]?.toLowerCase();
 
           if (!['on', 'off'].includes(value)) {
-            return reply(`Usage: ${prefix}${command} on/off`);
+            return await reply(`Usage: ${prefix}${command} on/off`);
           }
 
           await setFeatureSetting(
@@ -421,12 +425,12 @@ export async function handleIncomingMessage(sock, userId, message, dependencies 
             value === 'on'
           );
 
-          return reply(
+          return await reply(
             `✅ ${command} turned ${value.toUpperCase()}.`
           );
         }
 
-        return reply(
+        return await reply(
           `Unknown command: ${prefix}${command}\nSend ${prefix}menu to see supported commands.`
         );
     }
