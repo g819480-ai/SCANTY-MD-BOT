@@ -176,7 +176,7 @@ function makeAuthState(userId, creds) {
 
             if (type === 'app-state-sync-key' && value) {
               value =
-                proto.Message.AppStateSyncKeyData.fromObject(value);
+                proto.Message.AppStateSyncKeyData.create(value);
             }
 
             if (value) values[id] = value;
