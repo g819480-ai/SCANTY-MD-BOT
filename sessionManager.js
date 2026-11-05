@@ -16,11 +16,11 @@ import pg from 'pg';
 import { handleIncomingMessage } from './messageHandler.js';
 import { handleStatusUpdate } from './statusEvents.js';
 import { getFeatureSettings } from './featureSettings.js';
+
 import {
   cleanupExhaustedReconnect,
   createReconnectController,
   reconnectIfCurrent,
-  waitForSocketReady,
   withPairingLock
 } from './whatsappLifecycle.js';
 
@@ -59,8 +59,12 @@ const encryptionKey = crypto
 
 function normalizeQrValue(qr) {
   if (!qr) return null;
+
   if (typeof qr === 'string') return qr;
-  if (Buffer.isBuffer(qr)) return qr.toString('base64');
+
+  if (Buffer.isBuffer(qr)) {
+    return qr.toString('base64');
+  }
 
   if (typeof qr === 'object') {
     if (typeof qr.data !== 'undefined') {
@@ -176,8 +180,7 @@ function makeAuthState(userId, creds) {
             let value = await readRecord(userId, type, id);
 
             if (type === 'app-state-sync-key' && value) {
-              value =
-                proto.Message.AppStateSyncKeyData.create(value);
+              value = proto.Message.AppStateSyncKeyData.create(value);
             }
 
             if (value) values[id] = value;
@@ -409,7 +412,8 @@ async function attachSocket(
   state,
   captureQr = false,
   suppliedController = null,
-  expectedSocket = null
+  expectedSocket = null,
+  onConnectionUpdate = null
 ) {
   if (
     expectedSocket &&
@@ -488,12 +492,7 @@ async function attachSocket(
     });
 
     try {
-      await saveRecord(
-        userId,
-        'creds',
-        'main',
-        state.creds
-      );
+      await saveRecord(userId, 'creds', 'main', state.creds);
 
       console.log('WHATSAPP CREDS SAVED:', {
         registered: state.creds.registered === true,
@@ -507,7 +506,6 @@ async function attachSocket(
     }
   });
 
-  // Handle incoming notifications and outgoing self-chat messages.
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     console.log('WHATSAPP MESSAGE EVENT:', {
       type,
@@ -536,12 +534,27 @@ async function attachSocket(
     }
   });
 
-  sock.ev.on('connection.update', async ({
-    connection,
-    lastDisconnect,
-    qr
-  }) => {
+  sock.ev.on('connection.update', async update => {
+    const {
+      connection,
+      lastDisconnect,
+      qr
+    } = update;
+
     if (sessions.get(userId) !== sock) return;
+
+    // Notify the pairing flow from this original listener.
+    // This avoids missing an early QR event.
+    if (typeof onConnectionUpdate === 'function') {
+      try {
+        onConnectionUpdate(update);
+      } catch (error) {
+        console.error(
+          'Pairing readiness callback failed:',
+          error.message
+        );
+      }
+    }
 
     const statusCode =
       lastDisconnect?.error?.output?.statusCode;
@@ -566,9 +579,7 @@ async function attachSocket(
         });
       }
 
-      console.log(
-        `WhatsApp connected for user ${userId}`
-      );
+      console.log(`WhatsApp connected for user ${userId}`);
 
       await sendScantyWelcome(userId, sock);
       startPresenceHeartbeat(userId, sock);
@@ -656,11 +667,7 @@ export async function restoreUserSessions() {
     if (sessions.has(userId)) continue;
 
     try {
-      const creds = await readRecord(
-        userId,
-        'creds',
-        'main'
-      );
+      const creds = await readRecord(userId, 'creds', 'main');
 
       if (!creds?.registered) {
         unregistered++;
@@ -796,10 +803,65 @@ export async function startUserSession(
       qrStates.delete(userId);
 
       const state = makeAuthState(userId, savedCreds);
+
       let sock = null;
+      let readinessTimer = null;
+      let readinessResolve;
+      let readinessReject;
+      let readinessSettled = false;
+
+      const pairingReady = new Promise((resolve, reject) => {
+        readinessResolve = resolve;
+        readinessReject = reject;
+
+        readinessTimer = setTimeout(() => {
+          finishReadiness(
+            new Error(
+              'Timed out waiting for WhatsApp pairing readiness. Please try again.'
+            )
+          );
+        }, 45000);
+      });
+
+      function finishReadiness(error) {
+        if (readinessSettled) return;
+
+        readinessSettled = true;
+
+        if (readinessTimer) {
+          clearTimeout(readinessTimer);
+          readinessTimer = null;
+        }
+
+        if (error) {
+          readinessReject(error);
+        } else {
+          readinessResolve();
+        }
+      }
 
       try {
-        sock = await attachSocket(userId, state);
+        sock = await attachSocket(
+          userId,
+          state,
+          false,
+          null,
+          null,
+          update => {
+            if (update.qr) {
+              finishReadiness();
+              return;
+            }
+
+            if (update.connection === 'close') {
+              finishReadiness(
+                new Error(
+                  'WhatsApp connection closed before the pairing code could be requested. Please try again later.'
+                )
+              );
+            }
+          }
+        );
 
         if (!sock) {
           throw new Error(
@@ -807,62 +869,7 @@ export async function startUserSession(
           );
         }
 
-        /*
-         * Baileys emits the initial QR/pairing-ready update
-         * before the pairing code should be requested.
-         *
-         * Waiting for the QR update avoids requesting the
-         * pairing code immediately after the raw WebSocket
-         * becomes ready.
-         */
-        await new Promise((resolve, reject) => {
-          let settled = false;
-
-          const finish = error => {
-            if (settled) return;
-
-            settled = true;
-            clearTimeout(timeout);
-
-            if (error) {
-              reject(error);
-            } else {
-              resolve();
-            }
-          };
-
-          const timeout = setTimeout(() => {
-            finish(
-              new Error(
-                'Timed out waiting for WhatsApp pairing readiness. Please try again.'
-              )
-            );
-          }, 45000);
-
-          sock.ev.on('connection.update', update => {
-            if (sessions.get(userId) !== sock) {
-              finish(
-                new Error(
-                  'WhatsApp socket was replaced before pairing.'
-                )
-              );
-              return;
-            }
-
-            if (update.qr) {
-              finish();
-              return;
-            }
-
-            if (update.connection === 'close') {
-              finish(
-                new Error(
-                  'WhatsApp disconnected before pairing was ready.'
-                )
-              );
-            }
-          });
-        });
+        await pairingReady;
 
         if (sessions.get(userId) !== sock) {
           throw new Error(
@@ -870,9 +877,7 @@ export async function startUserSession(
           );
         }
 
-        const code = await sock.requestPairingCode(
-          phoneNumber
-        );
+        const code = await sock.requestPairingCode(phoneNumber);
 
         if (!code) {
           throw new Error(
@@ -888,118 +893,8 @@ export async function startUserSession(
           started: true
         };
       } catch (error) {
-        stopPresenceHeartbeat(userId);
+        finishReadiness(error);
 
-        const activeController =
-          reconnectControllers.get(userId);
-
-        activeController?.stop();
-
-        if (
-          reconnectControllers.get(userId) === activeController
-        ) {
-          reconnectControllers.delete(userId);
-        }
-
-        const activeContext =
-          reconnectContexts.get(userId);
-
-        if (activeContext?.controller === activeController) {
-          reconnectContexts.delete(userId);
-        }
-
-        if (sessions.get(userId) === sock) {
-          sessions.delete(userId);
-        }
-
-        sessionStatus.set(
-          userId,
-          'disconnected'
-        );
-
-        try {
-          sock?.end(error);
-        } catch {
-          // Socket may already be closed.
-        }
-
-        console.error(
-          'PAIRING REQUEST FAILED:',
-          {
-            userId,
-            message: error.message
-          }
-        );
-
-        throw error;
-      }
-    }
-  );
-}  return withPairingLock(
-    pairingLocks,
-    userId,
-    async () => {
-      if (!/^[a-f0-9-]{16,64}$/i.test(userId)) {
-        throw new Error('Invalid user ID.');
-      }
-
-      if (!/^\d{10,15}$/.test(phoneNumber)) {
-        throw new Error(
-          'Enter your country code and phone number using digits only.'
-        );
-      }
-
-      if (sessions.has(userId)) {
-        throw new Error(
-          'A WhatsApp session is already active for this user.'
-        );
-      }
-
-      const savedCreds = await readRecord(
-        userId,
-        'creds',
-        'main'
-      );
-
-      if (savedCreds?.registered) {
-        throw new Error(
-          'This WhatsApp account is already linked.'
-        );
-      }
-
-      qrStates.delete(userId);
-
-      const state = makeAuthState(userId, savedCreds);
-      const sock = await attachSocket(userId, state);
-
-      try {
-        if (!sock) {
-          throw new Error(
-            'WhatsApp socket was superseded before pairing.'
-          );
-        }
-
-        await waitForSocketReady(sock);
-
-        if (
-          sessions.get(userId) !== sock ||
-          sessionStatus.get(userId) === 'disconnected'
-        ) {
-          throw new Error(
-            'WhatsApp socket closed before pairing.'
-          );
-        }
-
-        const code = await sock.requestPairingCode(
-          phoneNumber
-        );
-
-        if (typeof onPairingCode === 'function') {
-          onPairingCode(code);
-        }
-
-        return { started: true };
-      } catch (error) {
         stopPresenceHeartbeat(userId);
 
         const activeController =
@@ -1034,10 +929,15 @@ export async function startUserSession(
 
         console.error('PAIRING REQUEST FAILED:', {
           userId,
-          message: error.message
+          message: error.message,
+          stack: error.stack
         });
 
         throw error;
+      } finally {
+        if (readinessTimer) {
+          clearTimeout(readinessTimer);
+        }
       }
     }
   );
