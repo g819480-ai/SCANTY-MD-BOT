@@ -1,4 +1,3 @@
-
 import {
   getFeatureSettings,
   setFeatureSetting,
@@ -7,6 +6,7 @@ import {
   listBotBans,
   unbanBotUser
 } from './featureSettings.js';
+import { isSocketOpen } from './whatsappLifecycle.js';
 
 const DEFAULT_PREFIX = '.';
 const COMMAND_COOLDOWN_MS = 3000;
@@ -155,7 +155,7 @@ function menuText() {
   ].join('\n');
 }
 
-export async function handleIncomingMessage(sock, userId, message) {
+export async function handleIncomingMessage(sock, userId, message, dependencies = {}) {
   if (!message?.key) return;
 
   const chatId = message.key.remoteJid;
@@ -178,20 +178,21 @@ export async function handleIncomingMessage(sock, userId, message) {
     : (message.key.participant || chatId);
 
   const senderPhone = phoneFromJid(senderJid);
+  const checkBanned = dependencies.isBotUserBanned || isBotUserBanned;
+  const loadSettings = dependencies.getFeatureSettings || getFeatureSettings;
 
-  // Protect database checks and settings retrieval.
   let settings;
 
   try {
     if (
       !selfChat &&
       senderPhone &&
-      await isBotUserBanned(userId, senderPhone)
+      await checkBanned(userId, senderPhone)
     ) return;
 
-    settings = await getFeatureSettings(userId);
+    settings = await loadSettings(userId);
   } catch (error) {
-    console.error('Message handler setup error:', error);
+    console.error('Message handler setup error:', error.message);
 
     try {
       await sock.sendMessage(
@@ -202,7 +203,7 @@ export async function handleIncomingMessage(sock, userId, message) {
         { quoted: message }
       );
     } catch (sendError) {
-      console.error('Could not send setup error reply:', sendError);
+      console.error('Could not send setup error reply:', sendError.message);
     }
 
     return;
@@ -222,6 +223,9 @@ export async function handleIncomingMessage(sock, userId, message) {
   const args = parts;
 
   if (!command || isRateLimited(`${userId}:${senderJid}`)) return;
+
+  // Log only command identifiers; never log message text, chat IDs, or credentials.
+  console.info('WHATSAPP COMMAND RECEIVED:', { command });
 
   const reply = response =>
     sock.sendMessage(
@@ -300,13 +304,11 @@ export async function handleIncomingMessage(sock, userId, message) {
       }
 
       case 'status': {
-        const open =
-          sock.ws?.readyState === (sock.ws?.OPEN ?? 1) &&
-          Boolean(sock.user);
+        const connected = isSocketOpen(sock.ws) && Boolean(sock.user?.id || sock.user?.lid);
 
         return reply(
-          `${open ? '✅ Connected' : '⚠️ Not connected'}\nAccount: ${
-            sock.user?.id || 'unknown'
+          `${connected ? '✅ Connected' : '⚠️ Not connected'}\nAccount: ${
+            sock.user?.id || sock.user?.lid || 'unknown'
           }\nPrefix: ${prefix}`
         );
       }
@@ -429,14 +431,14 @@ export async function handleIncomingMessage(sock, userId, message) {
         );
     }
   } catch (error) {
-    console.error('Message handler error:', error);
+    console.error('Message handler error:', error.message);
 
     try {
       await reply(
         '❌ Could not complete that command right now. Please try again later.'
       );
     } catch (sendError) {
-      console.error('Could not send command error reply:', sendError);
+      console.error('Could not send command error reply:', sendError.message);
     }
   }
 }
@@ -444,6 +446,7 @@ export async function handleIncomingMessage(sock, userId, message) {
 export const messageHandlerInternals = Object.freeze({
   getMessageText,
   isOwnerSelfChat,
+  isSocketOpen,
   parseEmojis,
   formatUptime,
   getGroupAdmins,
