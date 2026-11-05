@@ -1,0 +1,59 @@
+
+name: Baileys Security Repair
+
+on:
+  push:
+    branches:
+      - security/baileys-cve-2026-48063
+    paths:
+      - package.json
+      - package-lock.json
+      - .github/workflows/baileys-security-check.yml
+
+permissions:
+  contents: write
+
+jobs:
+  security-repair:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout security branch
+        uses: actions/checkout@v5
+        with:
+          ref: security/baileys-cve-2026-48063
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 20
+
+      - name: Regenerate package lock
+        run: npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify Baileys version
+        run: npm ls @whiskeysockets/baileys
+
+      - name: Run syntax checks
+        run: npm run check
+
+      - name: Run tests
+        run: npm test
+
+      - name: Run security audit
+        run: npm audit --audit-level=critical
+
+      - name: Commit updated lockfile
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package-lock.json
+          if git diff --cached --quiet; then
+            echo "package-lock.json is already up to date"
+          else
+            git commit -m "fix: update Baileys security lockfile"
+            git push origin HEAD:security/baileys-cve-2026-48063
+          fi
