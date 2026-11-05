@@ -176,7 +176,7 @@ function makeAuthState(userId, creds) {
 
             if (type === 'app-state-sync-key' && value) {
               value =
-                proto.Message.AppStateSyncKeyData.fromObject(value);
+                proto.Message.AppStateSyncKeyData.create(value);
             }
 
             if (value) values[id] = value;
@@ -452,30 +452,30 @@ async function attachSocket(
   });
 
   sock.ev.on('creds.update', async () => {
-  console.log('WHATSAPP CREDS UPDATE:', {
-    registered: state.creds.registered === true,
-    hasMe: Boolean(state.creds.me)
-  });
-
-  try {
-    await saveRecord(
-      userId,
-      'creds',
-      'main',
-      state.creds
-    );
-
-    console.log('WHATSAPP CREDS SAVED:', {
+    console.log('WHATSAPP CREDS UPDATE:', {
       registered: state.creds.registered === true,
       hasMe: Boolean(state.creds.me)
     });
-  } catch (error) {
-    console.error(
-      'Could not save credentials:',
-      error.message
-    );
-  }
-});
+
+    try {
+      await saveRecord(
+        userId,
+        'creds',
+        'main',
+        state.creds
+      );
+
+      console.log('WHATSAPP CREDS SAVED:', {
+        registered: state.creds.registered === true,
+        hasMe: Boolean(state.creds.me)
+      });
+    } catch (error) {
+      console.error(
+        'Could not save credentials:',
+        error.message
+      );
+    }
+  });
 
   // Handle both incoming notifications and outgoing self-chat messages.
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
