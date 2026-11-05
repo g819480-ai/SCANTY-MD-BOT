@@ -1,3 +1,4 @@
+
 import {
   getFeatureSettings,
   setFeatureSetting,
@@ -22,33 +23,57 @@ function getMessageText(message) {
   let content = message?.message;
   for (let i = 0; content && i < 6; i += 1) {
     const wrapped = content.ephemeralMessage?.message ||
-      content.viewOnceMessage?.message || content.viewOnceMessageV2?.message ||
-      content.viewOnceMessageV2Extension?.message || content.documentWithCaptionMessage?.message;
+      content.viewOnceMessage?.message ||
+      content.viewOnceMessageV2?.message ||
+      content.viewOnceMessageV2Extension?.message ||
+      content.documentWithCaptionMessage?.message;
     if (!wrapped) break;
     content = wrapped;
   }
-  return String(content?.conversation || content?.extendedTextMessage?.text ||
-    content?.imageMessage?.caption || content?.videoMessage?.caption ||
-    content?.documentMessage?.caption || '').trim();
+  return String(
+    content?.conversation ||
+    content?.extendedTextMessage?.text ||
+    content?.imageMessage?.caption ||
+    content?.videoMessage?.caption ||
+    content?.documentMessage?.caption ||
+    ''
+  ).trim();
 }
 
 function isOwnerSelfChat(sock, message, chatId) {
-  if (!message.key?.fromMe || !chatId || chatId.endsWith('@g.us') ||
-      chatId.endsWith('@newsletter') || chatId === 'status@broadcast') return false;
-  return [sock.user?.id, sock.user?.lid].map(normalizeJid).filter(Boolean).includes(normalizeJid(chatId));
+  if (
+    !message.key?.fromMe ||
+    !chatId ||
+    chatId.endsWith('@g.us') ||
+    chatId.endsWith('@newsletter') ||
+    chatId === 'status@broadcast'
+  ) return false;
+
+  return [sock.user?.id, sock.user?.lid]
+    .map(normalizeJid)
+    .filter(Boolean)
+    .includes(normalizeJid(chatId));
 }
 
 function isRateLimited(key) {
   const now = Date.now();
   const previous = lastCommands.get(key);
-  if (previous && now - previous < COMMAND_COOLDOWN_MS) return true;
+
+  if (previous && now - previous < COMMAND_COOLDOWN_MS) {
+    return true;
+  }
+
   lastCommands.set(key, now);
+
   if (lastCommands.size > MAX_RATE_LIMIT_ENTRIES) {
     for (const [entry, timestamp] of lastCommands) {
-      if (now - timestamp > COMMAND_COOLDOWN_MS) lastCommands.delete(entry);
+      if (now - timestamp > COMMAND_COOLDOWN_MS) {
+        lastCommands.delete(entry);
+      }
       if (lastCommands.size <= MAX_RATE_LIMIT_ENTRIES) break;
     }
   }
+
   return false;
 }
 
@@ -59,7 +84,13 @@ function phoneFromJid(jid) {
 
 function parseEmojis(input) {
   const values = input.split(',').map(value => value.trim()).filter(Boolean);
-  if (values.length < 1 || values.length > 10 || values.some(value => value.length > 16)) return null;
+
+  if (
+    values.length < 1 ||
+    values.length > 10 ||
+    values.some(value => value.length > 16)
+  ) return null;
+
   return [...new Set(values)];
 }
 
@@ -69,13 +100,22 @@ function formatUptime(totalSeconds) {
   const hours = Math.floor((seconds % 86400) / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
   const remainingSeconds = seconds % 60;
-  return [days ? `${days}d` : null, hours ? `${hours}h` : null,
-    minutes ? `${minutes}m` : null, `${remainingSeconds}s`].filter(Boolean).join(' ');
+
+  return [
+    days ? `${days}d` : null,
+    hours ? `${hours}h` : null,
+    minutes ? `${minutes}m` : null,
+    `${remainingSeconds}s`
+  ].filter(Boolean).join(' ');
 }
 
 function getGroupAdmins(metadata) {
   return (metadata?.participants || [])
-    .filter(participant => participant.admin === 'admin' || participant.admin === 'superadmin')
+    .filter(
+      participant =>
+        participant.admin === 'admin' ||
+        participant.admin === 'superadmin'
+    )
     .map(participant => participant.id);
 }
 
@@ -117,45 +157,120 @@ function menuText() {
 
 export async function handleIncomingMessage(sock, userId, message) {
   if (!message?.key) return;
+
   const chatId = message.key.remoteJid;
-  if (!chatId || chatId === 'status@broadcast' || chatId.endsWith('@newsletter')) return;
+
+  if (
+    !chatId ||
+    chatId === 'status@broadcast' ||
+    chatId.endsWith('@newsletter')
+  ) return;
+
   const selfChat = isOwnerSelfChat(sock, message, chatId);
+
   if (message.key.fromMe && !selfChat) return;
 
   const text = getMessageText(message);
   if (!text) return;
-  const senderJid = selfChat ? normalizeJid(sock.user?.id || sock.user?.lid) :
-    (message.key.participant || chatId);
-  const senderPhone = phoneFromJid(senderJid);
-  if (!selfChat && senderPhone && await isBotUserBanned(userId, senderPhone)) return;
 
-  const settings = await getFeatureSettings(userId);
+  const senderJid = selfChat
+    ? normalizeJid(sock.user?.id || sock.user?.lid)
+    : (message.key.participant || chatId);
+
+  const senderPhone = phoneFromJid(senderJid);
+
+  // Protect database checks and settings retrieval.
+  let settings;
+
+  try {
+    if (
+      !selfChat &&
+      senderPhone &&
+      await isBotUserBanned(userId, senderPhone)
+    ) return;
+
+    settings = await getFeatureSettings(userId);
+  } catch (error) {
+    console.error('Message handler setup error:', error);
+
+    try {
+      await sock.sendMessage(
+        chatId,
+        {
+          text: '❌ SCANTY MD BOT could not process this message right now. Please try again later.'
+        },
+        { quoted: message }
+      );
+    } catch (sendError) {
+      console.error('Could not send setup error reply:', sendError);
+    }
+
+    return;
+  }
+
   const prefix = settings.prefix || DEFAULT_PREFIX;
+
   if (!text.startsWith(prefix)) return;
-  const parts = text.slice(prefix.length).trim().split(/\s+/).filter(Boolean);
+
+  const parts = text
+    .slice(prefix.length)
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+
   const command = (parts.shift() || '').toLowerCase();
   const args = parts;
+
   if (!command || isRateLimited(`${userId}:${senderJid}`)) return;
 
-  const reply = response => sock.sendMessage(chatId, { text: response }, { quoted: message });
+  const reply = response =>
+    sock.sendMessage(
+      chatId,
+      { text: response },
+      { quoted: message }
+    );
+
   const ownerOnly = async () => {
     if (selfChat) return true;
-    await reply('Only the bot owner can manage bot settings and access bans. Send the command from the bot account’s own chat.');
+
+    await reply(
+      'Only the bot owner can manage bot settings and access bans. Send the command from the bot account’s own chat.'
+    );
+
     return false;
   };
 
   try {
     switch (command) {
       case 'menu':
-      case 'help': return reply(menuText());
-      case 'ping': return reply('🏓 SCANTY MD BOT is responding.');
-      case 'uptime': return reply(`⏱️ Bot uptime: ${formatUptime(process.uptime())}`);
+      case 'help':
+        return reply(menuText());
+
+      case 'ping':
+        return reply('🏓 SCANTY MD BOT is responding.');
+
+      case 'uptime':
+        return reply(
+          `⏱️ Bot uptime: ${formatUptime(process.uptime())}`
+        );
+
       case 'jid':
-        return reply(`Chat: ${chatId}\nSender: ${senderJid}${message.key.participant ? `\nParticipant: ${message.key.participant}` : ''}`);
+        return reply(
+          `Chat: ${chatId}\nSender: ${senderJid}${
+            message.key.participant
+              ? `\nParticipant: ${message.key.participant}`
+              : ''
+          }`
+        );
+
       case 'groupinfo': {
-        if (!chatId.endsWith('@g.us')) return reply('This command only works in a group.');
+        if (!chatId.endsWith('@g.us')) {
+          return reply('This command only works in a group.');
+        }
+
         const metadata = await sock.groupMetadata(chatId);
         const admins = getGroupAdmins(metadata);
+
         return reply([
           `Group: ${metadata.subject || '(unnamed)'}`,
           `ID: ${metadata.id || chatId}`,
@@ -164,17 +279,38 @@ export async function handleIncomingMessage(sock, userId, message) {
           metadata.desc ? `Description: ${metadata.desc}` : null
         ].filter(Boolean).join('\n'));
       }
+
       case 'admins': {
-        if (!chatId.endsWith('@g.us')) return reply('This command only works in a group.');
+        if (!chatId.endsWith('@g.us')) {
+          return reply('This command only works in a group.');
+        }
+
         const metadata = await sock.groupMetadata(chatId);
         const admins = getGroupAdmins(metadata);
-        if (!admins.length) return reply('No group admins were returned.');
-        return reply(`Group admins (${admins.length}):\n${admins.map(jid => `• ${jid}`).join('\n')}`);
+
+        if (!admins.length) {
+          return reply('No group admins were returned.');
+        }
+
+        return reply(
+          `Group admins (${admins.length}):\n${admins
+            .map(jid => `• ${jid}`)
+            .join('\n')}`
+        );
       }
+
       case 'status': {
-        const open = sock.ws?.readyState === (sock.ws?.OPEN ?? 1) && Boolean(sock.user);
-        return reply(`${open ? '✅ Connected' : '⚠️ Not connected'}\nAccount: ${sock.user?.id || 'unknown'}\nPrefix: ${prefix}`);
+        const open =
+          sock.ws?.readyState === (sock.ws?.OPEN ?? 1) &&
+          Boolean(sock.user);
+
+        return reply(
+          `${open ? '✅ Connected' : '⚠️ Not connected'}\nAccount: ${
+            sock.user?.id || 'unknown'
+          }\nPrefix: ${prefix}`
+        );
       }
+
       case 'settings':
         return reply([
           'SCANTY MD BOT SETTINGS',
@@ -188,47 +324,120 @@ export async function handleIncomingMessage(sock, userId, message) {
           `Status emojis: ${(settings.statusEmojis || []).join(' ')}`,
           `Prefix: ${prefix}`
         ].join('\n'));
+
       case 'setemojis': {
         if (!(await ownerOnly())) return;
+
         const emojis = parseEmojis(args.join(''));
-        if (!emojis) return reply('Usage: .setemojis ❤️,🔥,😍,😂 (1–10 emoji values)');
+
+        if (!emojis) {
+          return reply(
+            'Usage: .setemojis ❤️,🔥,😍,😂 (1–10 emoji values)'
+          );
+        }
+
         await setFeatureSetting(userId, 'statusEmojis', emojis);
-        return reply(`✅ Status emojis saved: ${emojis.join(' ')}`);
+
+        return reply(
+          `✅ Status emojis saved: ${emojis.join(' ')}`
+        );
       }
+
       case 'ban': {
         if (!(await ownerOnly())) return;
+
         const target = args[0];
-        if (!target) return reply('Usage: .ban <phone number> (include country code)');
+
+        if (!target) {
+          return reply(
+            'Usage: .ban <phone number> (include country code)'
+          );
+        }
+
         const added = await banBotUser(userId, target);
-        return reply(added ? '✅ Number banned from using this bot.' : 'That number is already banned from this bot.');
+
+        return reply(
+          added
+            ? '✅ Number banned from using this bot.'
+            : 'That number is already banned from this bot.'
+        );
       }
+
       case 'bans': {
         if (!(await ownerOnly())) return;
+
         const bans = await listBotBans(userId);
-        if (!bans.length) return reply('There are no numbers banned from this bot.');
-        return reply(`Bot access bans (${bans.length}):\n${bans.map(ban => `• ${ban.phoneNumber}`).join('\n')}`);
+
+        if (!bans.length) {
+          return reply('There are no numbers banned from this bot.');
+        }
+
+        return reply(
+          `Bot access bans (${bans.length}):\n${bans
+            .map(ban => `• ${ban.phoneNumber}`)
+            .join('\n')}`
+        );
       }
+
       case 'unban': {
         if (!(await ownerOnly())) return;
-        const mention = message.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
+
+        const mention =
+          message.message?.extendedTextMessage?.contextInfo
+            ?.mentionedJid?.[0];
+
         const target = args[0] || phoneFromJid(mention);
-        if (!target) return reply('Usage: .unban <phone number>\nThis removes a bot-access ban; it does not add anyone to a WhatsApp group.');
+
+        if (!target) {
+          return reply(
+            'Usage: .unban <phone number>\nThis removes a bot-access ban; it does not add anyone to a WhatsApp group.'
+          );
+        }
+
         const removed = await unbanBotUser(userId, target);
-        return reply(removed ? '✅ Number unbanned from this bot.' : 'That number was not on this bot’s ban list.');
+
+        return reply(
+          removed
+            ? '✅ Number unbanned from this bot.'
+            : 'That number was not on this bot’s ban list.'
+        );
       }
+
       default:
         if (Object.hasOwn(toggleSettings, command)) {
           if (!(await ownerOnly())) return;
+
           const value = args[0]?.toLowerCase();
-          if (!['on', 'off'].includes(value)) return reply(`Usage: ${prefix}${command} on/off`);
-          await setFeatureSetting(userId, toggleSettings[command], value === 'on');
-          return reply(`✅ ${command} turned ${value.toUpperCase()}.`);
+
+          if (!['on', 'off'].includes(value)) {
+            return reply(`Usage: ${prefix}${command} on/off`);
+          }
+
+          await setFeatureSetting(
+            userId,
+            toggleSettings[command],
+            value === 'on'
+          );
+
+          return reply(
+            `✅ ${command} turned ${value.toUpperCase()}.`
+          );
         }
-        return reply(`Unknown command: ${prefix}${command}\nSend ${prefix}menu to see supported commands.`);
+
+        return reply(
+          `Unknown command: ${prefix}${command}\nSend ${prefix}menu to see supported commands.`
+        );
     }
   } catch (error) {
-    console.error('Message handler error:', error.message);
-    try { await reply(`❌ ${error.message || 'Could not complete that command.'}`); } catch { /* socket may have closed */ }
+    console.error('Message handler error:', error);
+
+    try {
+      await reply(
+        '❌ Could not complete that command right now. Please try again later.'
+      );
+    } catch (sendError) {
+      console.error('Could not send command error reply:', sendError);
+    }
   }
 }
 
