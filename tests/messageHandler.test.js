@@ -1,6 +1,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+
 import {
   handleIncomingMessage,
   messageHandlerInternals
@@ -19,7 +20,9 @@ function createMessage(text, overrides = {}) {
   };
 }
 
-function createSocket(sendMessage = async () => ({ key: { id: 'test' } })) {
+function createSocket(sendMessage = async () => ({
+  key: { id: 'test-message' }
+})) {
   return {
     user: {
       id: '233200000000@s.whatsapp.net'
@@ -31,6 +34,15 @@ function createSocket(sendMessage = async () => ({ key: { id: 'test' } })) {
   };
 }
 
+function createDependencies() {
+  return {
+    isBotUserBanned: async () => false,
+    getFeatureSettings: async () => ({
+      prefix: '.'
+    })
+  };
+}
+
 test('command menu advertises supported commands', () => {
   const menu = messageHandlerInternals.menuText();
 
@@ -39,18 +51,34 @@ test('command menu advertises supported commands', () => {
   assert.match(menu, /\.alwaysonline on\/off/);
   assert.match(menu, /\.autoviewstatus on\/off/);
   assert.match(menu, /\.statusreact on\/off/);
-  assert.doesNotMatch(menu, /\.translate|\.sticker|\.toimg/);
+
+  assert.doesNotMatch(
+    menu,
+    /\.translate|\.sticker|\.toimg/
+  );
+
   assert.match(menu, /does not add/i);
 });
 
-test('message parser unwraps ephemeral and caption messages', () => {
+test('message parser unwraps supported WhatsApp message formats', () => {
   const { getMessageText } = messageHandlerInternals;
 
   assert.equal(
     getMessageText({
       message: {
+        conversation: '.ping'
+      }
+    }),
+    '.ping'
+  );
+
+  assert.equal(
+    getMessageText({
+      message: {
         ephemeralMessage: {
-          message: { conversation: '.ping' }
+          message: {
+            conversation: '.ping'
+          }
         }
       }
     }),
@@ -60,7 +88,9 @@ test('message parser unwraps ephemeral and caption messages', () => {
   assert.equal(
     getMessageText({
       message: {
-        imageMessage: { caption: '.help' }
+        imageMessage: {
+          caption: '.help'
+        }
       }
     }),
     '.help'
@@ -71,7 +101,9 @@ test('message parser unwraps ephemeral and caption messages', () => {
       message: {
         viewOnceMessage: {
           message: {
-            extendedTextMessage: { text: '.status' }
+            extendedTextMessage: {
+              text: '.status'
+            }
           }
         }
       }
@@ -80,7 +112,7 @@ test('message parser unwraps ephemeral and caption messages', () => {
   );
 });
 
-test('emoji parser rejects invalid lists and removes duplicates', () => {
+test('emoji parser removes duplicates and rejects invalid lists', () => {
   const { parseEmojis } = messageHandlerInternals;
 
   assert.deepEqual(
@@ -89,39 +121,51 @@ test('emoji parser rejects invalid lists and removes duplicates', () => {
   );
 
   assert.equal(parseEmojis(''), null);
+
   assert.equal(
     parseEmojis(Array(11).fill('😀').join(',')),
     null
   );
 });
 
-test('incoming .ping sends the expected WhatsApp reply', async () => {
+test('incoming .ping sends the exact expected WhatsApp reply', async () => {
   const sent = [];
 
   const sock = createSocket(async (...args) => {
     sent.push(args);
-    return { key: { id: 'test-message' } };
+    return {
+      key: { id: 'successful-test-message' }
+    };
   });
 
   const message = createMessage('.ping');
 
-  await handleIncomingMessage(sock, 'test-user', message, {
-    isBotUserBanned: async () => false,
-    getFeatureSettings: async () => ({
-      prefix: '.'
-    })
-  });
+  await handleIncomingMessage(
+    sock,
+    'test-user-ping-success',
+    message,
+    createDependencies()
+  );
 
   assert.equal(sent.length, 1);
+
   assert.equal(
     sent[0][1].text,
-    '🏓 SCANTY MD BOT is active.'
+    '🏓 SCANTY MD BOT is responding.'
   );
-  assert.equal(sent[0][0], message.key.remoteJid);
-  assert.equal(sent[0][2].quoted, message);
+
+  assert.equal(
+    sent[0][0],
+    message.key.remoteJid
+  );
+
+  assert.equal(
+    sent[0][2].quoted,
+    message
+  );
 });
 
-test('incoming .ping handles a rejected WhatsApp send without an unhandled rejection', async () => {
+test('failed WhatsApp sends are caught without an unhandled rejection', async () => {
   let attempts = 0;
 
   const sock = createSocket(async () => {
@@ -136,24 +180,21 @@ test('incoming .ping handles a rejected WhatsApp send without an unhandled rejec
     await assert.doesNotReject(
       handleIncomingMessage(
         sock,
-        'test-user',
+        'test-user-ping-failure',
         createMessage('.ping'),
-        {
-          isBotUserBanned: async () => false,
-          getFeatureSettings: async () => ({
-            prefix: '.'
-          })
-        }
+        createDependencies()
       )
     );
   } finally {
     console.error = originalError;
   }
 
+  // First attempt: command reply.
+  // Second attempt: fallback error reply.
   assert.equal(attempts, 2);
 });
 
-test('messages without commands do not send replies', async () => {
+test('ordinary messages without a command do not send replies', async () => {
   let attempts = 0;
 
   const sock = createSocket(async () => {
@@ -162,14 +203,9 @@ test('messages without commands do not send replies', async () => {
 
   await handleIncomingMessage(
     sock,
-    'test-user',
+    'test-user-ordinary-message',
     createMessage('hello'),
-    {
-      isBotUserBanned: async () => false,
-      getFeatureSettings: async () => ({
-        prefix: '.'
-      })
-    }
+    createDependencies()
   );
 
   assert.equal(attempts, 0);
