@@ -1,3 +1,4 @@
+
 import makeWASocket, {
   initAuthCreds,
   BufferJSON,
@@ -312,12 +313,41 @@ function getReconnectController(userId, state, captureQr) {
     reasons: DisconnectReason,
     maxAttempts: 10,
 
-    onState: status => {
+    onState: (status, detail, socketIdentity) => {
       if (
         status === 'reconnecting' ||
         status === 'disconnected'
       ) {
         sessionStatus.set(userId, status);
+      }
+
+      if (status === 'reconnecting') {
+        console.warn('WHATSAPP RECONNECT SCHEDULED:', {
+          userId,
+          attempt: controller?.attempt,
+          socketIsCurrent: sessions.get(userId) === detail
+        });
+      }
+
+      if (status === 'reconnect_failed') {
+        console.error('WHATSAPP RECONNECT FAILED:', {
+          userId,
+          attempt: controller?.attempt,
+          message: detail?.message || String(detail),
+          stack: detail?.stack,
+          socketIsCurrent: sessions.get(userId) === socketIdentity
+        });
+      }
+
+      if (status === 'connected') {
+        console.log('WHATSAPP RECONNECT SUCCESSFUL:', { userId });
+      }
+
+      if (status === 'disconnected') {
+        console.error('WHATSAPP RECONNECT EXHAUSTED:', {
+          userId,
+          socketIsCurrent: sessions.get(userId) === detail
+        });
       }
     },
 
@@ -452,32 +482,32 @@ async function attachSocket(
   });
 
   sock.ev.on('creds.update', async () => {
-  console.log('WHATSAPP CREDS UPDATE:', {
-    registered: state.creds.registered === true,
-    hasMe: Boolean(state.creds.me)
-  });
-
-  try {
-    await saveRecord(
-      userId,
-      'creds',
-      'main',
-      state.creds
-    );
-
-    console.log('WHATSAPP CREDS SAVED:', {
+    console.log('WHATSAPP CREDS UPDATE:', {
       registered: state.creds.registered === true,
       hasMe: Boolean(state.creds.me)
     });
-  } catch (error) {
-    console.error(
-      'Could not save credentials:',
-      error.message
-    );
-  }
-});
 
-  // Handle both incoming notifications and outgoing self-chat messages.
+    try {
+      await saveRecord(
+        userId,
+        'creds',
+        'main',
+        state.creds
+      );
+
+      console.log('WHATSAPP CREDS SAVED:', {
+        registered: state.creds.registered === true,
+        hasMe: Boolean(state.creds.me)
+      });
+    } catch (error) {
+      console.error(
+        'Could not save credentials:',
+        error.message
+      );
+    }
+  });
+
+  // Handle incoming notifications and outgoing self-chat messages.
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     console.log('WHATSAPP MESSAGE EVENT:', {
       type,
