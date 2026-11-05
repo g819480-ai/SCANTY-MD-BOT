@@ -18,6 +18,26 @@ export function reconnectDelay(attempt, statusCode, reasons) {
 }
 
 /**
+ * Detect an open Baileys v7 WebSocket wrapper, preferring its state flags.
+ * readyState remains a fallback for older wrappers and WebSocket-compatible
+ * test doubles.
+ */
+export function isSocketOpen(ws) {
+  if (!ws || ws.isClosed === true || ws.isClosing === true) return false;
+  if (ws.isOpen === true) return true;
+  if (ws.isOpen === false) return false;
+  return ws.readyState === (ws.OPEN ?? 1);
+}
+
+function socketIsClosedOrClosing(ws) {
+  if (ws.isClosed === true || ws.isClosing === true) return true;
+  if (ws.isOpen === true) return false;
+  const closedState = ws.CLOSED ?? 3;
+  const closingState = ws.CLOSING ?? 2;
+  return ws.readyState === closedState || ws.readyState === closingState;
+}
+
+/**
  * Removes only reconnect state owned by the exhausted socket/controller pair.
  * This function is deliberately memory-only: it never touches persisted auth.
  */
@@ -159,13 +179,17 @@ export async function withPairingLock(locks, userId, action) {
 export function waitForSocketReady(sock, timeoutMs = 20000) {
   const ws = sock?.ws;
   if (!ws) return Promise.reject(new Error('WhatsApp WebSocket is unavailable.'));
-  const openState = ws.OPEN ?? 1;
-  if (ws.readyState === openState) return Promise.resolve();
+  if (socketIsClosedOrClosing(ws)) {
+    return Promise.reject(new Error('WhatsApp WebSocket is already closed or closing.'));
+  }
+  if (isSocketOpen(ws)) return Promise.resolve();
 
   return new Promise((resolve, reject) => {
     let timer;
+    let settled = false;
+
     const cleanup = () => {
-      clearTimeout(timer);
+      if (timer !== undefined) clearTimeout(timer);
       ws.off?.('open', onOpen);
       ws.off?.('error', onError);
       ws.off?.('close', onClose);
@@ -173,22 +197,46 @@ export function waitForSocketReady(sock, timeoutMs = 20000) {
       ws.removeListener?.('error', onError);
       ws.removeListener?.('close', onClose);
     };
-    const onOpen = () => { cleanup(); resolve(); };
-    const onError = error => {
+
+    const settle = (error) => {
+      if (settled) return;
+      settled = true;
       cleanup();
-      reject(error || new Error('WhatsApp WebSocket failed.'));
+      if (error) reject(error);
+      else resolve();
+    };
+
+    const onOpen = () => {
+      if (socketIsClosedOrClosing(ws)) {
+        settle(new Error('WhatsApp WebSocket closed before pairing.'));
+        return;
+      }
+      settle();
+    };
+    const onError = error => {
+      settle(error instanceof Error ? error : new Error('WhatsApp WebSocket failed.'));
     };
     const onClose = () => {
-      cleanup();
-      reject(new Error('WhatsApp WebSocket closed before pairing.'));
+      settle(new Error('WhatsApp WebSocket closed before pairing.'));
     };
-    timer = setTimeout(() => {
-      cleanup();
-      reject(new Error('Timed out waiting for WhatsApp WebSocket readiness.'));
-    }, timeoutMs);
+
     ws.once('open', onOpen);
     ws.once('error', onError);
     ws.once('close', onClose);
-    if (ws.readyState === openState) onOpen();
+
+    // Re-check after listeners are attached to avoid missing an open/close
+    // transition between the initial state check and listener registration.
+    if (socketIsClosedOrClosing(ws)) {
+      settle(new Error('WhatsApp WebSocket is already closed or closing.'));
+      return;
+    }
+    if (isSocketOpen(ws)) {
+      settle();
+      return;
+    }
+
+    timer = setTimeout(() => {
+      settle(new Error('Timed out waiting for WhatsApp WebSocket readiness.'));
+    }, timeoutMs);
   });
 }
