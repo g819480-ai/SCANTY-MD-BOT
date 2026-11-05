@@ -796,6 +796,180 @@ export async function startUserSession(
       qrStates.delete(userId);
 
       const state = makeAuthState(userId, savedCreds);
+      let sock = null;
+
+      try {
+        sock = await attachSocket(userId, state);
+
+        if (!sock) {
+          throw new Error(
+            'WhatsApp socket could not be created.'
+          );
+        }
+
+        /*
+         * Baileys emits the initial QR/pairing-ready update
+         * before the pairing code should be requested.
+         *
+         * Waiting for the QR update avoids requesting the
+         * pairing code immediately after the raw WebSocket
+         * becomes ready.
+         */
+        await new Promise((resolve, reject) => {
+          let settled = false;
+
+          const finish = error => {
+            if (settled) return;
+
+            settled = true;
+            clearTimeout(timeout);
+
+            if (error) {
+              reject(error);
+            } else {
+              resolve();
+            }
+          };
+
+          const timeout = setTimeout(() => {
+            finish(
+              new Error(
+                'Timed out waiting for WhatsApp pairing readiness. Please try again.'
+              )
+            );
+          }, 45000);
+
+          sock.ev.on('connection.update', update => {
+            if (sessions.get(userId) !== sock) {
+              finish(
+                new Error(
+                  'WhatsApp socket was replaced before pairing.'
+                )
+              );
+              return;
+            }
+
+            if (update.qr) {
+              finish();
+              return;
+            }
+
+            if (update.connection === 'close') {
+              finish(
+                new Error(
+                  'WhatsApp disconnected before pairing was ready.'
+                )
+              );
+            }
+          });
+        });
+
+        if (sessions.get(userId) !== sock) {
+          throw new Error(
+            'WhatsApp socket is no longer active.'
+          );
+        }
+
+        const code = await sock.requestPairingCode(
+          phoneNumber
+        );
+
+        if (!code) {
+          throw new Error(
+            'WhatsApp did not return a pairing code.'
+          );
+        }
+
+        if (typeof onPairingCode === 'function') {
+          onPairingCode(code);
+        }
+
+        return {
+          started: true
+        };
+      } catch (error) {
+        stopPresenceHeartbeat(userId);
+
+        const activeController =
+          reconnectControllers.get(userId);
+
+        activeController?.stop();
+
+        if (
+          reconnectControllers.get(userId) === activeController
+        ) {
+          reconnectControllers.delete(userId);
+        }
+
+        const activeContext =
+          reconnectContexts.get(userId);
+
+        if (activeContext?.controller === activeController) {
+          reconnectContexts.delete(userId);
+        }
+
+        if (sessions.get(userId) === sock) {
+          sessions.delete(userId);
+        }
+
+        sessionStatus.set(
+          userId,
+          'disconnected'
+        );
+
+        try {
+          sock?.end(error);
+        } catch {
+          // Socket may already be closed.
+        }
+
+        console.error(
+          'PAIRING REQUEST FAILED:',
+          {
+            userId,
+            message: error.message
+          }
+        );
+
+        throw error;
+      }
+    }
+  );
+}  return withPairingLock(
+    pairingLocks,
+    userId,
+    async () => {
+      if (!/^[a-f0-9-]{16,64}$/i.test(userId)) {
+        throw new Error('Invalid user ID.');
+      }
+
+      if (!/^\d{10,15}$/.test(phoneNumber)) {
+        throw new Error(
+          'Enter your country code and phone number using digits only.'
+        );
+      }
+
+      if (sessions.has(userId)) {
+        throw new Error(
+          'A WhatsApp session is already active for this user.'
+        );
+      }
+
+      const savedCreds = await readRecord(
+        userId,
+        'creds',
+        'main'
+      );
+
+      if (savedCreds?.registered) {
+        throw new Error(
+          'This WhatsApp account is already linked.'
+        );
+      }
+
+      qrStates.delete(userId);
+
+      const state = makeAuthState(userId, savedCreds);
       const sock = await attachSocket(userId, state);
 
       try {
