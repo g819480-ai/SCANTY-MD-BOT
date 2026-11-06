@@ -408,7 +408,7 @@ async function handleRequest(req, res) {
     req.method === 'POST' &&
     url.pathname === '/api/public/session'
   ) {
-    if (rateLimit(req, res, 5)) return;
+    if (rateLimit(req, res, 100)) return;
 
     try {
       const guestId = crypto.randomUUID();
