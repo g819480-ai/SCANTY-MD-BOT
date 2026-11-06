@@ -54,13 +54,16 @@ if (
   );
 }
 
+const databaseUrl = new URL(DATABASE_URL);
+
+databaseUrl.searchParams.set('uselibpqcompat', 'true');
+databaseUrl.searchParams.set('sslmode', 'require');
+
 const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  connectionString: databaseUrl.toString(),
   max: 5,
   connectionTimeoutMillis: 10000
 });
-
 const ALLOWED_SETTINGS = [
   'alwaysOnline',
   'autoViewStatus',
