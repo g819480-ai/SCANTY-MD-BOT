@@ -1,16 +1,9 @@
-import pg from 'pg';
 
-const { Pool } = pg;
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL?.includes('localhost')
-    ? false
-    : { rejectUnauthorized: false },
-  max: 3,
-  connectionTimeoutMillis: 10000
-});
+import { getMongoDb } from './mongo.js';
 
-export const STATUS_EMOJIS = ['❤️', '🔥', '😍', '😂', '🥰', '👏', '👍', '💯', '😘'];
+export const STATUS_EMOJIS = [
+  '❤️', '🔥', '😍', '😂', '🥰', '👏', '👍', '💯', '😘'
+];
 
 const DEFAULT_SETTINGS = Object.freeze({
   alwaysOnline: false,
@@ -28,38 +21,36 @@ const DEFAULT_SETTINGS = Object.freeze({
 
 function normalizePhoneNumber(input) {
   const number = String(input ?? '').replace(/[\s+()-]/g, '');
+
   if (!/^\d{7,15}$/.test(number)) {
     throw new Error('Enter a phone number containing 7 to 15 digits.');
   }
+
   return number;
 }
 
 export async function initializeFeatureSettings() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS bot_settings (
-      user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-      settings JSONB NOT NULL DEFAULT '{}'::jsonb,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
+  const db = await getMongoDb();
 
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS bot_bans (
-      owner_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      phone_number TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (owner_user_id, phone_number)
-    )
-  `);
+  await db.collection('bot_settings').createIndex(
+    { user_id: 1 },
+    { unique: true }
+  );
+
+  await db.collection('bot_bans').createIndex(
+    { user_id: 1, phone_number: 1 },
+    { unique: true }
+  );
 }
 
 export async function getFeatureSettings(userId) {
-  const result = await pool.query(
-    'SELECT settings FROM bot_settings WHERE user_id = $1',
-    [userId]
-  );
+  const db = await getMongoDb();
 
-  const saved = result.rows[0]?.settings || {};
+  const savedDocument = await db.collection('bot_settings').findOne({
+    user_id: String(userId)
+  });
+
+  const saved = savedDocument?.settings || {};
 
   return {
     ...DEFAULT_SETTINGS,
@@ -138,72 +129,85 @@ export async function setFeatureSetting(userId, key, value) {
 
   current[key] = validatedValue;
 
-  await pool.query(
-    `INSERT INTO bot_settings (user_id, settings, updated_at)
-     VALUES ($1, $2::jsonb, NOW())
-     ON CONFLICT (user_id)
-     DO UPDATE SET
-       settings = EXCLUDED.settings,
-       updated_at = NOW()`,
-    [userId, JSON.stringify(current)]
+  const db = await getMongoDb();
+
+  await db.collection('bot_settings').updateOne(
+    { user_id: String(userId) },
+    {
+      $set: {
+        user_id: String(userId),
+        settings: current,
+        updated_at: new Date()
+      },
+      $setOnInsert: {
+        _id: String(userId)
+      }
+    },
+    { upsert: true }
   );
 
   return current;
 }
 
 export async function listBotBans(userId) {
-  const result = await pool.query(
-    `SELECT phone_number, created_at
-     FROM bot_bans
-     WHERE owner_user_id = $1
-     ORDER BY created_at DESC`,
-    [userId]
-  );
+  const db = await getMongoDb();
 
-  return result.rows.map(row => ({
+  const rows = await db.collection('bot_bans')
+    .find({ user_id: String(userId) })
+    .sort({ banned_at: -1 })
+    .toArray();
+
+  return rows.map(row => ({
     phoneNumber: row.phone_number,
-    createdAt: row.created_at
+    createdAt: row.banned_at
   }));
 }
 
 export async function isBotUserBanned(userId, phoneNumber) {
   const number = normalizePhoneNumber(phoneNumber);
+  const db = await getMongoDb();
 
-  const result = await pool.query(
-    `SELECT 1
-     FROM bot_bans
-     WHERE owner_user_id = $1 AND phone_number = $2`,
-    [userId, number]
-  );
+  const result = await db.collection('bot_bans').findOne({
+    user_id: String(userId),
+    phone_number: number
+  });
 
-  return result.rowCount > 0;
+  return Boolean(result);
 }
 
 export async function banBotUser(userId, phoneNumber) {
   const number = normalizePhoneNumber(phoneNumber);
+  const db = await getMongoDb();
 
-  const result = await pool.query(
-    `INSERT INTO bot_bans (owner_user_id, phone_number)
-     VALUES ($1, $2)
-     ON CONFLICT DO NOTHING
-     RETURNING phone_number`,
-    [userId, number]
+  const result = await db.collection('bot_bans').updateOne(
+    {
+      user_id: String(userId),
+      phone_number: number
+    },
+    {
+      $setOnInsert: {
+        _id: `${userId}:${number}`,
+        user_id: String(userId),
+        phone_number: number,
+        banned_at: new Date()
+      }
+    },
+    { upsert: true }
   );
 
-  return result.rowCount > 0;
+  return result.upsertedCount > 0;
 }
 
 export async function unbanBotUser(userId, phoneNumber) {
   const number = normalizePhoneNumber(phoneNumber);
+  const db = await getMongoDb();
 
-  const result = await pool.query(
-    `DELETE FROM bot_bans
-     WHERE owner_user_id = $1 AND phone_number = $2
-     RETURNING phone_number`,
-    [userId, number]
-  );
+  const result = await db.collection('bot_bans').deleteOne({
+    user_id: String(userId),
+    phone_number: number
+  });
 
-  return result.rowCount > 0;
+  return result.deletedCount > 0;
 }
 
 export function getDefaultFeatureSettings() {
