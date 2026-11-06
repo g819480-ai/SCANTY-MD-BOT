@@ -10,6 +10,7 @@ import {
   startUserSession,
   startUserQrSession,
   getUserQrState,
+  getQrMonitoringStates, 
   getUserSessionStatus,
   restoreUserSessions
 } from './sessionManager.js';
@@ -735,7 +736,19 @@ async function handleRequest(req, res) {
   }
 
   // ADMIN OVERVIEW AND EXISTING NON-GUEST USERS
+// ADMIN: QR SESSION MONITORING (NEVER RETURNS QR PAYLOADS)
+if (
+  req.method === 'GET' &&
+  url.pathname === '/api/admin/qr-sessions'
+) {
+  const admin = await requireAdmin(req, res);
+  if (!admin) return;
 
+  return send(res, 200, {
+    success: true,
+    sessions: getQrMonitoringStates()
+  });
+}
   if (
     req.method === 'GET' &&
     (
