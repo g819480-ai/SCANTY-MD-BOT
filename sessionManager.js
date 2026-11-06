@@ -901,11 +901,48 @@ export async function startUserSession(
         'main'
       );
 
-      if (savedCreds?.registered) {
-        throw new Error(
-          'This WhatsApp account is already linked.'
-        );
-      }
+      const existingSocket = sessions.get(userId);
+
+if (existingSocket) {
+  const existingStatus = sessionStatus.get(userId);
+  const existingContext = reconnectContexts.get(userId);
+  const existingController = reconnectControllers.get(userId);
+
+  if (
+    existingStatus === 'connected' ||
+    existingContext?.state?.creds?.registered === true
+  ) {
+    throw new Error(
+      'This WhatsApp account is already connected.'
+    );
+  }
+
+  existingController?.stop();
+  clearQrExpiryTimer(userId);
+  stopPresenceHeartbeat(userId);
+
+  if (sessions.get(userId) === existingSocket) {
+    sessions.delete(userId);
+  }
+
+  if (existingController &&
+      reconnectControllers.get(userId) === existingController) {
+    reconnectControllers.delete(userId);
+  }
+
+  if (existingContext &&
+      reconnectContexts.get(userId) === existingContext) {
+    reconnectContexts.delete(userId);
+  }
+
+  sessionStatus.set(userId, 'disconnected');
+
+  try {
+    existingSocket.end(
+      new Error('Replacing previous QR pairing attempt.')
+    );
+  } catch {}
+}
 
       qrStates.delete(userId);
 
