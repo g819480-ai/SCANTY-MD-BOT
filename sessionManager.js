@@ -1,4 +1,3 @@
-
 import makeWASocket, {
   initAuthCreds,
   BufferJSON,
@@ -39,7 +38,20 @@ const reconnectContexts = new Map();
 // Serializes writes to the same WhatsApp session record.
 const recordWriteQueues = new Map();
 
+// Tracks complete async creds.update handlers.
+// This is separate from recordWriteQueues because the event handler
+// itself may still be waiting before its saveRecord() call begins.
+const pendingCredentialWrites = new Set();
+
 let encryptedDataType = null;
+
+// Prevents new sockets, pairings and reconnects while Render is terminating
+// the application.
+let sessionManagerShuttingDown = false;
+
+// Makes shutdown idempotent if SIGTERM/SIGINT or another caller invokes it
+// more than once.
+let shutdownPromise = null;
 
 const secret = process.env.SESSION_ENCRYPTION_KEY?.trim();
 
@@ -259,10 +271,28 @@ async function saveRecord(userId, type, id, value) {
   return currentWrite;
 }
 
-// Allows pending session writes to finish before a controlled shutdown.
+// Allows pending session writes and credential event handlers
+// to finish before a controlled shutdown.
 export async function flushSessionWrites() {
-  while (recordWriteQueues.size > 0) {
-    const pending = Array.from(recordWriteQueues.values());
+  while (
+    pendingCredentialWrites.size > 0 ||
+    recordWriteQueues.size > 0
+  ) {
+    const pendingHandlers =
+      Array.from(pendingCredentialWrites);
+
+    const pendingRecords =
+      Array.from(recordWriteQueues.values());
+
+    const pending = [
+      ...pendingHandlers,
+      ...pendingRecords
+    ];
+
+    if (pending.length === 0) {
+      break;
+    }
+
     await Promise.allSettled(pending);
   }
 }
@@ -387,29 +417,43 @@ function cleanupStalePairingSocket(userId) {
 }
 
 async function updatePresence(userId, sock) {
-  if (sessions.get(userId) !== sock) return;
+  if (
+    sessionManagerShuttingDown ||
+    sessions.get(userId) !== sock
+  ) {
+    return;
+  }
 
   try {
     const settings = await getFeatureSettings(userId);
+
+    if (sessionManagerShuttingDown) return;
 
     await sock.sendPresenceUpdate(
       settings.alwaysOnline ? 'available' : 'unavailable'
     );
   } catch (error) {
-    console.error(
-      `Presence update failed for ${userId}:`,
-      error.message
-    );
+    if (!sessionManagerShuttingDown) {
+      console.error(
+        `Presence update failed for ${userId}:`,
+        error.message
+      );
+    }
   }
 }
 
 function startPresenceHeartbeat(userId, sock) {
   stopPresenceHeartbeat(userId);
 
+  if (sessionManagerShuttingDown) return;
+
   updatePresence(userId, sock);
 
   const timer = setInterval(() => {
-    if (sessions.get(userId) !== sock) {
+    if (
+      sessionManagerShuttingDown ||
+      sessions.get(userId) !== sock
+    ) {
       stopPresenceHeartbeat(userId);
       return;
     }
@@ -472,14 +516,20 @@ async function sendScantyWelcome(userId, sock) {
       `SCANTY MD welcome sequence sent for ${userId}`
     );
   } catch (error) {
-    console.error(
-      'SCANTY MD welcome sequence failed:',
-      error.message
-    );
+    if (!sessionManagerShuttingDown) {
+      console.error(
+        'SCANTY MD welcome sequence failed:',
+        error.message
+      );
+    }
   }
 }
 
 function getReconnectController(userId, state, captureQr) {
+  if (sessionManagerShuttingDown) {
+    return null;
+  }
+
   const existing = reconnectControllers.get(userId);
 
   if (existing) return existing;
@@ -543,6 +593,10 @@ function getReconnectController(userId, state, captureQr) {
     },
 
     reconnect: async expectedSocket => {
+      if (sessionManagerShuttingDown) {
+        return;
+      }
+
       const context = reconnectContexts.get(userId);
 
       if (
@@ -553,18 +607,24 @@ function getReconnectController(userId, state, captureQr) {
         return;
       }
 
+      if (sessionManagerShuttingDown) {
+        return;
+      }
+
       await reconnectIfCurrent({
         currentSocket: sessions.get(userId),
         expectedSocket,
 
         reconnect: () =>
-          attachSocket(
-            userId,
-            context.state,
-            context.captureQr,
-            controller,
-            expectedSocket
-          )
+          sessionManagerShuttingDown
+            ? null
+            : attachSocket(
+                userId,
+                context.state,
+                context.captureQr,
+                controller,
+                expectedSocket
+              )
       });
     }
   });
@@ -589,6 +649,10 @@ async function attachSocket(
   expectedSocket = null,
   onConnectionUpdate = null
 ) {
+  if (sessionManagerShuttingDown) {
+    return null;
+  }
+
   if (
     expectedSocket &&
     sessions.get(userId) !== expectedSocket
@@ -599,6 +663,10 @@ async function attachSocket(
   const controller =
     suppliedController ||
     getReconnectController(userId, state, captureQr);
+
+  if (!controller || sessionManagerShuttingDown) {
+    return null;
+  }
 
   const context = reconnectContexts.get(userId);
 
@@ -614,6 +682,10 @@ async function attachSocket(
   console.log('Fetching the latest WhatsApp Web version...');
 
   const { version } = await fetchLatestBaileysVersion();
+
+  if (sessionManagerShuttingDown) {
+    return null;
+  }
 
   if (
     expectedSocket &&
@@ -637,6 +709,14 @@ async function attachSocket(
     connectTimeoutMs: 30000
   });
 
+  if (sessionManagerShuttingDown) {
+    try {
+      sock.end(new Error('Server shutting down.'));
+    } catch {}
+
+    return null;
+  }
+
   if (
     expectedSocket &&
     sessions.get(userId) !== expectedSocket
@@ -659,28 +739,44 @@ async function attachSocket(
     expectedSocket: sock
   });
 
-  sock.ev.on('creds.update', async () => {
-    console.log('WHATSAPP CREDS UPDATE:', {
-      registered: state.creds.registered === true,
-      hasMe: Boolean(state.creds.me)
-    });
-
-    try {
-      await saveRecord(userId, 'creds', 'main', state.creds);
-
-      console.log('WHATSAPP CREDS SAVED:', {
+  sock.ev.on('creds.update', () => {
+    const credentialWrite = (async () => {
+      console.log('WHATSAPP CREDS UPDATE:', {
         registered: state.creds.registered === true,
         hasMe: Boolean(state.creds.me)
       });
-    } catch (error) {
-      console.error(
-        'Could not save credentials:',
-        error.message
-      );
-    }
+
+      try {
+        await saveRecord(
+          userId,
+          'creds',
+          'main',
+          state.creds
+        );
+
+        console.log('WHATSAPP CREDS SAVED:', {
+          registered: state.creds.registered === true,
+          hasMe: Boolean(state.creds.me)
+        });
+      } catch (error) {
+        console.error(
+          'Could not save credentials:',
+          error.message
+        );
+      }
+    })();
+
+    pendingCredentialWrites.add(credentialWrite);
+
+    credentialWrite.then(
+      () => pendingCredentialWrites.delete(credentialWrite),
+      () => pendingCredentialWrites.delete(credentialWrite)
+    );
   });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (sessionManagerShuttingDown) return;
+
     console.log('WHATSAPP MESSAGE EVENT:', {
       type,
       count: messages?.length || 0
@@ -689,6 +785,8 @@ async function attachSocket(
     if (type !== 'notify' && type !== 'append') return;
 
     for (const message of messages || []) {
+      if (sessionManagerShuttingDown) return;
+
       try {
         if (type === 'append' && !message.key?.fromMe) {
           continue;
@@ -751,6 +849,16 @@ async function attachSocket(
     }
 
     if (connection === 'open') {
+      if (sessionManagerShuttingDown) {
+        try {
+          sock.end(
+            new Error('Server shutting down after connection opened.')
+          );
+        } catch {}
+
+        return;
+      }
+
       controller.connected();
       sessionStatus.set(userId, 'connected');
 
@@ -802,6 +910,12 @@ async function attachSocket(
       message: lastDisconnect?.error?.message,
       error: lastDisconnect?.error?.toString()
     });
+
+    // During Render shutdown we deliberately do NOT schedule a reconnect.
+    if (sessionManagerShuttingDown) {
+      sessionStatus.set(userId, 'disconnected');
+      return;
+    }
 
     if (!controller.schedule(statusCode, sock)) {
       cleanupExhaustedReconnect({
@@ -884,12 +998,20 @@ export async function restoreUserSessions() {
   for (const { user_id: userId } of result.rows) {
     if (sessions.has(userId)) continue;
 
+    if (sessionManagerShuttingDown) {
+      break;
+    }
+
     try {
       const creds = await readRecord(userId, 'creds', 'main');
 
       if (!creds?.registered) {
         unregistered++;
         continue;
+      }
+
+      if (sessionManagerShuttingDown) {
+        break;
       }
 
       await attachSocket(
@@ -927,14 +1049,20 @@ function serializeQrState(state, includeQr = true) {
   if (!state) return null;
 
   const remainingSeconds = state.expiresAt
-    ? Math.max(0, Math.ceil((state.expiresAt - Date.now()) / 1000))
+    ? Math.max(
+        0,
+        Math.ceil(
+          (state.expiresAt - Date.now()) / 1000
+        )
+      )
     : null;
 
   return {
     ...(includeQr
       ? {
           qr:
-            state.status === 'qr' && remainingSeconds > 0
+            state.status === 'qr' &&
+            remainingSeconds > 0
               ? state.qr
               : null
         }
@@ -972,14 +1100,29 @@ export function getQrMonitoringStates() {
       userId,
       ...serializeQrState(state, false)
     }))
-    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    .sort(
+      (a, b) =>
+        (b.updatedAt || 0) - (a.updatedAt || 0)
+    );
 }
 
 export async function startUserQrSession(userId) {
+  if (sessionManagerShuttingDown) {
+    throw new Error(
+      'WhatsApp service is shutting down. Please try again shortly.'
+    );
+  }
+
   return withPairingLock(
     pairingLocks,
     userId,
     async () => {
+      if (sessionManagerShuttingDown) {
+        throw new Error(
+          'WhatsApp service is shutting down. Please try again shortly.'
+        );
+      }
+
       if (!/^[a-f0-9-]{16,64}$/i.test(userId)) {
         throw new Error('Invalid user ID.');
       }
@@ -996,7 +1139,8 @@ export async function startUserQrSession(userId) {
         );
       }
 
-      const cleaned = cleanupStalePairingSocket(userId);
+      const cleaned =
+        cleanupStalePairingSocket(userId);
 
       if (!cleaned) {
         throw new Error(
@@ -1004,7 +1148,8 @@ export async function startUserQrSession(userId) {
         );
       }
 
-      const state = makeAuthState(userId, savedCreds);
+      const state =
+        makeAuthState(userId, savedCreds);
 
       clearQrExpiryTimer(userId);
 
@@ -1014,7 +1159,17 @@ export async function startUserQrSession(userId) {
         updatedAt: Date.now()
       });
 
-      await attachSocket(userId, state, true);
+      const socket = await attachSocket(
+        userId,
+        state,
+        true
+      );
+
+      if (!socket) {
+        throw new Error(
+          'WhatsApp service is shutting down or the socket could not be created.'
+        );
+      }
 
       return { started: true };
     }
@@ -1026,10 +1181,22 @@ export async function startUserSession(
   phoneNumber,
   onPairingCode
 ) {
+  if (sessionManagerShuttingDown) {
+    throw new Error(
+      'WhatsApp service is shutting down. Please try again shortly.'
+    );
+  }
+
   return withPairingLock(
     pairingLocks,
     userId,
     async () => {
+      if (sessionManagerShuttingDown) {
+        throw new Error(
+          'WhatsApp service is shutting down. Please try again shortly.'
+        );
+      }
+
       if (!/^[a-f0-9-]{16,64}$/i.test(userId)) {
         throw new Error('Invalid user ID.');
       }
@@ -1040,11 +1207,12 @@ export async function startUserSession(
         );
       }
 
-      const savedCreds = await readRecord(
-        userId,
-        'creds',
-        'main'
-      );
+      const savedCreds =
+        await readRecord(
+          userId,
+          'creds',
+          'main'
+        );
 
       if (savedCreds?.registered) {
         throw new Error(
@@ -1052,7 +1220,8 @@ export async function startUserSession(
         );
       }
 
-      const cleaned = cleanupStalePairingSocket(userId);
+      const cleaned =
+        cleanupStalePairingSocket(userId);
 
       if (!cleaned) {
         throw new Error(
@@ -1063,11 +1232,18 @@ export async function startUserSession(
       clearQrExpiryTimer(userId);
       qrStates.delete(userId);
 
-      const state = makeAuthState(userId, savedCreds);
+      const state =
+        makeAuthState(userId, savedCreds);
 
       let sock = null;
 
       try {
+        if (sessionManagerShuttingDown) {
+          throw new Error(
+            'WhatsApp service is shutting down.'
+          );
+        }
+
         sock = await attachSocket(
           userId,
           state,
@@ -1085,7 +1261,16 @@ export async function startUserSession(
           userId
         );
 
-        await waitForSocketReady(sock, 30000);
+        await waitForSocketReady(
+          sock,
+          30000
+        );
+
+        if (sessionManagerShuttingDown) {
+          throw new Error(
+            'WhatsApp service is shutting down.'
+          );
+        }
 
         if (sessions.get(userId) !== sock) {
           throw new Error(
@@ -1093,7 +1278,16 @@ export async function startUserSession(
           );
         }
 
-        await new Promise(resolve => setTimeout(resolve, 3000));
+        await new Promise(
+          resolve =>
+            setTimeout(resolve, 3000)
+        );
+
+        if (sessionManagerShuttingDown) {
+          throw new Error(
+            'WhatsApp service is shutting down.'
+          );
+        }
 
         if (sessions.get(userId) !== sock) {
           throw new Error(
@@ -1101,9 +1295,10 @@ export async function startUserSession(
           );
         }
 
-        const code = await sock.requestPairingCode(
-          phoneNumber
-        );
+        const code =
+          await sock.requestPairingCode(
+            phoneNumber
+          );
 
         if (!code) {
           throw new Error(
@@ -1111,7 +1306,9 @@ export async function startUserSession(
           );
         }
 
-        if (typeof onPairingCode === 'function') {
+        if (
+          typeof onPairingCode === 'function'
+        ) {
           onPairingCode(code);
         }
 
@@ -1134,41 +1331,194 @@ export async function startUserSession(
 
         if (
           activeController &&
-          activeContext?.controller === activeController &&
+          activeContext?.controller ===
+            activeController &&
           activeContext.captureQr === false &&
           (
             !sock ||
-            activeContext.expectedSocket === sock
+            activeContext.expectedSocket ===
+              sock
           )
         ) {
           activeController.stop();
-          reconnectControllers.delete(userId);
-          reconnectContexts.delete(userId);
+          reconnectControllers.delete(
+            userId
+          );
+          reconnectContexts.delete(
+            userId
+          );
         }
 
-        if (sock && sessions.get(userId) === sock) {
+        if (
+          sock &&
+          sessions.get(userId) === sock
+        ) {
           sessions.delete(userId);
         }
 
         if (
           !sock ||
-          sessions.get(userId) === undefined
+          sessions.get(userId) ===
+            undefined
         ) {
-          sessionStatus.set(userId, 'disconnected');
+          sessionStatus.set(
+            userId,
+            'disconnected'
+          );
         }
 
         try {
           sock?.end(error);
         } catch {}
 
-        console.error('PAIRING REQUEST FAILED:', {
-          userId,
-          message: error.message,
-          stack: error.stack
-        });
+        console.error(
+          'PAIRING REQUEST FAILED:',
+          {
+            userId,
+            message: error.message,
+            stack: error.stack
+          }
+        );
 
         throw error;
       }
     }
   );
+}
+
+/**
+ * Gracefully shuts down the WhatsApp session manager.
+ *
+ * Shutdown order:
+ * 1. Block new pairing/reconnect/session activity.
+ * 2. Stop reconnect controllers and timers.
+ * 3. Close active Baileys sockets.
+ * 4. Wait for in-flight creds.update handlers.
+ * 5. Flush serialized PostgreSQL writes.
+ * 6. Close the session manager PostgreSQL pool.
+ */
+export async function closeSessionManagerGracefully() {
+  if (shutdownPromise) {
+    return shutdownPromise;
+  }
+
+  shutdownPromise = (async () => {
+    console.log(
+      '--- STARTING GRACEFUL WHATSAPP SHUTDOWN ---'
+    );
+
+    sessionManagerShuttingDown = true;
+
+    // Stop all reconnect controllers first so a socket closing
+    // cannot schedule a new WhatsApp connection.
+    console.log(
+      `Stopping ${reconnectControllers.size} reconnect controller(s)...`
+    );
+
+    for (const [
+      userId,
+      controller
+    ] of reconnectControllers.entries()) {
+      try {
+        controller.stop();
+      } catch (error) {
+        console.error(
+          `Error stopping reconnect controller for ${userId}:`,
+          error.message
+        );
+      }
+    }
+
+    reconnectControllers.clear();
+
+    // Stop QR expiration timers and presence heartbeats.
+    for (const timer of presenceTimers.values()) {
+      clearInterval(timer);
+    }
+
+    for (const timer of qrExpiryTimers.values()) {
+      clearTimeout(timer);
+    }
+
+    presenceTimers.clear();
+    qrExpiryTimers.clear();
+
+    // Close active WhatsApp sockets.
+    console.log(
+      `Closing ${sessions.size} active WhatsApp socket(s)...`
+    );
+
+    const activeSockets =
+      Array.from(sessions.entries());
+
+    for (const [
+      userId,
+      sock
+    ] of activeSockets) {
+      try {
+        sessionStatus.set(
+          userId,
+          'shutting_down'
+        );
+
+        sock.end(
+          new Error(
+            'SCANTY MD BOT server is shutting down.'
+          )
+        );
+      } catch (error) {
+        console.error(
+          `Error closing socket for user ${userId}:`,
+          error.message
+        );
+      }
+    }
+
+    // Prevent stale reconnect contexts from creating
+    // another socket while shutdown is draining.
+    reconnectContexts.clear();
+    pairingLocks.clear();
+
+    // Do not rely only on recordWriteQueues.
+    // A creds.update handler may still be executing before
+    // it reaches saveRecord().
+    console.log(
+      `Waiting for ${pendingCredentialWrites.size} in-flight credential handler(s)...`
+    );
+
+    await flushSessionWrites();
+
+    console.log(
+      'All pending WhatsApp credential/session writes have completed.'
+    );
+
+    // Now that every pending database write has finished,
+    // safely close the session-manager pool.
+    console.log(
+      'Draining WhatsApp session PostgreSQL connection pool...'
+    );
+
+    try {
+      await pool.end();
+
+      console.log(
+        'WhatsApp session PostgreSQL pool disconnected safely.'
+      );
+    } catch (error) {
+      console.error(
+        'Error while draining WhatsApp session PostgreSQL pool:',
+        error.message
+      );
+    }
+
+    sessions.clear();
+    sessionStatus.clear();
+    qrStates.clear();
+
+    console.log(
+      '--- WHATSAPP ENGINE CLEANLY TERMINATED ---'
+    );
+  })();
+
+  return shutdownPromise;
 }
