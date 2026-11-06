@@ -47,14 +47,8 @@ const encryptionKey = crypto
 
 function normalizeQrValue(qr) {
   if (!qr) return null;
-
-  if (typeof qr === 'string') {
-    return qr;
-  }
-
-  if (Buffer.isBuffer(qr)) {
-    return qr.toString('base64');
-  }
+  if (typeof qr === 'string') return qr;
+  if (Buffer.isBuffer(qr)) return qr.toString('base64');
 
   if (typeof qr === 'object') {
     if (typeof qr.data !== 'undefined') {
@@ -71,6 +65,8 @@ function normalizeQrValue(qr) {
 
   return String(qr);
 }
+
+/* ENCRYPTED MONGODB SESSION STORAGE */
 
 function encrypt(value) {
   const iv = crypto.randomBytes(12);
@@ -113,13 +109,6 @@ function decrypt(value) {
     decipher.final()
   ]).toString('utf8');
 }
-
-/*
- * MONGODB SESSION STORAGE
- *
- * Existing encrypted_data values are preserved.
- * Do not change SESSION_ENCRYPTION_KEY.
- */
 
 async function saveRecord(userId, type, id, value) {
   const db = await getMongoDb();
@@ -164,9 +153,7 @@ async function readRecord(userId, type, id) {
     record_id: String(id)
   });
 
-  if (!record) {
-    return null;
-  }
+  if (!record) return null;
 
   return JSON.parse(
     decrypt(record.encrypted_data),
@@ -191,9 +178,7 @@ function makeAuthState(userId, creds) {
                 proto.Message.AppStateSyncKeyData.create(value);
             }
 
-            if (value) {
-              values[id] = value;
-            }
+            if (value) values[id] = value;
           })
         );
 
@@ -213,6 +198,8 @@ function makeAuthState(userId, creds) {
   };
 }
 
+/* PRESENCE */
+
 function stopPresenceHeartbeat(userId) {
   const timer = presenceTimers.get(userId);
 
@@ -223,9 +210,7 @@ function stopPresenceHeartbeat(userId) {
 }
 
 async function updatePresence(userId, sock) {
-  if (sessions.get(userId) !== sock) {
-    return;
-  }
+  if (sessions.get(userId) !== sock) return;
 
   try {
     const settings = await getFeatureSettings(userId);
@@ -258,6 +243,8 @@ function startPresenceHeartbeat(userId, sock) {
   presenceTimers.set(userId, timer);
 }
 
+/* WELCOME MESSAGE */
+
 async function sendScantyWelcome(userId, sock) {
   try {
     const alreadyWelcomed = await readRecord(
@@ -266,9 +253,7 @@ async function sendScantyWelcome(userId, sock) {
       'welcome_notice_sent'
     );
 
-    if (alreadyWelcomed) {
-      return;
-    }
+    if (alreadyWelcomed) return;
 
     const linkedJid = sock.user?.id;
 
@@ -282,14 +267,21 @@ async function sendScantyWelcome(userId, sock) {
       ? `${linkedJid.split('@')[0].split(':')[0]}@s.whatsapp.net`
       : linkedJid;
 
-    const image = await readFile(
-      new URL('./scanty-md-welcome-final.jpg', import.meta.url)
-    );
+    try {
+      const image = await readFile(
+        new URL('./scanty-md-welcome-final.jpg', import.meta.url)
+      );
 
-    await sock.sendMessage(ownJid, {
-      image,
-      mimetype: 'image/jpeg'
-    });
+      await sock.sendMessage(ownJid, {
+        image,
+        mimetype: 'image/jpeg'
+      });
+    } catch (error) {
+      console.warn(
+        'Welcome image unavailable:',
+        error.message
+      );
+    }
 
     await sock.sendMessage(ownJid, {
       text:
@@ -319,12 +311,12 @@ async function sendScantyWelcome(userId, sock) {
   }
 }
 
+/* RECONNECTION */
+
 function getReconnectController(userId, state, captureQr) {
   const existing = reconnectControllers.get(userId);
 
-  if (existing) {
-    return existing;
-  }
+  if (existing) return existing;
 
   let controller;
 
@@ -343,8 +335,7 @@ function getReconnectController(userId, state, captureQr) {
       if (status === 'reconnecting') {
         console.warn('WHATSAPP RECONNECT SCHEDULED:', {
           userId,
-          attempt: controller?.attempt,
-          socketIsCurrent: sessions.get(userId) === detail
+          attempt: controller?.attempt
         });
       }
 
@@ -353,8 +344,7 @@ function getReconnectController(userId, state, captureQr) {
           userId,
           attempt: controller?.attempt,
           message: detail?.message || String(detail),
-          stack: detail?.stack,
-          socketIsCurrent: sessions.get(userId) === socketIdentity
+          stack: detail?.stack
         });
       }
 
@@ -422,6 +412,8 @@ function getReconnectController(userId, state, captureQr) {
 
   return controller;
 }
+
+/* WHATSAPP SOCKET */
 
 async function attachSocket(
   userId,
@@ -503,12 +495,8 @@ async function attachSocket(
 
   let pairingReady = false;
 
+  /* Save credentials whenever Baileys updates them. */
   sock.ev.on('creds.update', async () => {
-    console.log('WHATSAPP CREDS UPDATE:', {
-      registered: state.creds.registered === true,
-      hasMe: Boolean(state.creds.me)
-    });
-
     try {
       await saveRecord(
         userId,
@@ -523,21 +511,20 @@ async function attachSocket(
       });
     } catch (error) {
       console.error(
-        'Could not save credentials:',
+        'Could not save WhatsApp credentials:',
         error.message
       );
     }
   });
 
+  /* Incoming messages and status updates. */
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     console.log('WHATSAPP MESSAGE EVENT:', {
       type,
       count: messages?.length || 0
     });
 
-    if (type !== 'notify' && type !== 'append') {
-      return;
-    }
+    if (type !== 'notify' && type !== 'append') return;
 
     for (const message of messages || []) {
       try {
@@ -559,35 +546,57 @@ async function attachSocket(
     }
   });
 
+  /* Connection, pairing and reconnection events. */
   sock.ev.on('connection.update', async ({
     connection,
     lastDisconnect,
-    qr
+    qr,
+    isNewLogin
   }) => {
-    if (sessions.get(userId) !== sock) {
-      return;
-    }
+    if (sessions.get(userId) !== sock) return;
 
     const statusCode =
       lastDisconnect?.error?.output?.statusCode;
 
-    // QR event is also the readiness signal for pairing-code login.
-    if (qr) {
-      if (captureQr) {
-        qrStates.set(userId, {
-          qr: normalizeQrValue(qr),
-          status: 'qr',
-          updatedAt: Date.now()
-        });
-      }
+    /*
+     * IMPORTANT PAIRING FIX:
+     * Baileys emits "connecting" before the QR event.
+     * Either event is sufficient to begin requesting a
+     * phone-number pairing code.
+     */
+    if (
+      pairingCallbacks &&
+      !pairingReady &&
+      (connection === 'connecting' || Boolean(qr))
+    ) {
+      pairingReady = true;
 
-      if (
-        pairingCallbacks &&
-        !pairingReady
-      ) {
-        pairingReady = true;
-        pairingCallbacks.onReady?.();
-      }
+      console.log(
+        'WhatsApp pairing-ready event received.'
+      );
+
+      pairingCallbacks.onReady?.();
+    }
+
+    /* Save QR code for the dashboard. */
+    if (qr && captureQr) {
+      qrStates.set(userId, {
+        qr: normalizeQrValue(qr),
+        status: 'qr',
+        updatedAt: Date.now()
+      });
+    }
+
+    /*
+     * A new login means WhatsApp has accepted the pairing.
+     * A restart may follow; the reconnect controller handles it.
+     */
+    if (isNewLogin) {
+      sessionStatus.set(userId, 'reconnecting');
+
+      console.log(
+        `WhatsApp accepted new pairing for user ${userId}.`
+      );
     }
 
     if (connection === 'open') {
@@ -630,9 +639,7 @@ async function attachSocket(
       return;
     }
 
-    if (connection !== 'close') {
-      return;
-    }
+    if (connection !== 'close') return;
 
     stopPresenceHeartbeat(userId);
 
@@ -647,14 +654,15 @@ async function attachSocket(
       error: closeError.toString()
     });
 
-    // Reject pairing readiness only if the QR event has not arrived.
-    if (
-      pairingCallbacks &&
-      !pairingReady
-    ) {
+    if (pairingCallbacks && !pairingReady) {
       pairingCallbacks.onClosed?.(closeError);
     }
 
+    /*
+     * DisconnectReason.restartRequired is a normal part
+     * of a successful new WhatsApp pairing. Do not delete
+     * credentials; reconnect using the updated auth state.
+     */
     if (!controller.schedule(statusCode, sock)) {
       cleanupExhaustedReconnect({
         userId,
@@ -673,9 +681,7 @@ async function attachSocket(
   return sock;
 }
 
-/*
- * Initialize MongoDB indexes for WhatsApp session records.
- */
+/* INITIALIZE MONGODB SESSION STORAGE */
 
 export async function initializeSessionStorage() {
   const db = await getMongoDb();
@@ -691,8 +697,12 @@ export async function initializeSessionStorage() {
     }
   );
 
-  console.log('MongoDB WhatsApp session storage initialized.');
+  console.log(
+    'MongoDB WhatsApp session storage initialized.'
+  );
 }
+
+/* RESTORE REGISTERED WHATSAPP SESSIONS */
 
 export async function restoreUserSessions() {
   const db = await getMongoDb();
@@ -714,9 +724,7 @@ export async function restoreUserSessions() {
   );
 
   for (const userId of userIds) {
-    if (sessions.has(userId)) {
-      continue;
-    }
+    if (sessions.has(userId)) continue;
 
     try {
       const creds = await readRecord(
@@ -757,9 +765,13 @@ export async function restoreUserSessions() {
   return restored;
 }
 
+/* SESSION STATUS */
+
 export function getUserSessionStatus(userId) {
   return sessionStatus.get(userId) || 'not_connected';
 }
+
+/* QR STATUS FOR DASHBOARD */
 
 export function getUserQrState(userId) {
   const state = qrStates.get(userId);
@@ -776,6 +788,8 @@ export function getUserQrState(userId) {
     status: state.status
   };
 }
+
+/* QR CODE LOGIN */
 
 export async function startUserQrSession(userId) {
   return withPairingLock(
@@ -818,6 +832,8 @@ export async function startUserQrSession(userId) {
     }
   );
 }
+
+/* PHONE NUMBER PAIRING CODE LOGIN */
 
 export async function startUserSession(
   userId,
@@ -878,7 +894,9 @@ export async function startUserSession(
           rejectReady(
             error instanceof Error
               ? error
-              : new Error('WhatsApp closed before pairing was ready.')
+              : new Error(
+                  'WhatsApp closed before pairing was ready.'
+                )
           );
         }
       };
@@ -886,6 +904,18 @@ export async function startUserSession(
       let sock = null;
 
       try {
+        /*
+         * Start timeout before socket creation so a slow
+         * WhatsApp version lookup cannot hang the request.
+         */
+        readinessTimer = setTimeout(() => {
+          rejectReady(
+            new Error(
+              'WhatsApp did not become ready for pairing within 45 seconds. Please try again.'
+            )
+          );
+        }, 45000);
+
         sock = await attachSocket(
           userId,
           state,
@@ -901,18 +931,7 @@ export async function startUserSession(
           );
         }
 
-        readinessTimer = setTimeout(() => {
-          rejectReady(
-            new Error(
-              'WhatsApp did not send its pairing-ready QR event in time. Please try again.'
-            )
-          );
-        }, 30000);
-
         await readiness;
-
-        clearTimeout(readinessTimer);
-        readinessTimer = null;
 
         if (
           sessions.get(userId) !== sock ||
@@ -924,7 +943,7 @@ export async function startUserSession(
         }
 
         console.log(
-          'WhatsApp pairing-ready event received. Requesting pairing code.'
+          'Requesting WhatsApp phone pairing code.'
         );
 
         const code = await sock.requestPairingCode(
@@ -948,11 +967,6 @@ export async function startUserSession(
         return { started: true };
 
       } catch (error) {
-        if (readinessTimer) {
-          clearTimeout(readinessTimer);
-          readinessTimer = null;
-        }
-
         stopPresenceHeartbeat(userId);
 
         const activeController =
@@ -989,10 +1003,16 @@ export async function startUserSession(
 
         console.error('PAIRING REQUEST FAILED:', {
           userId,
-          message: error.message
+          message: error.message,
+          stack: error.stack
         });
 
         throw error;
+
+      } finally {
+        if (readinessTimer) {
+          clearTimeout(readinessTimer);
+        }
       }
     }
   );
