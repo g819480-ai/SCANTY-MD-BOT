@@ -6,7 +6,8 @@ test('command menu advertises only the supported command family', () => {
   const menu = messageHandlerInternals.menuText();
   assert.match(menu, /\.ping/);
   assert.match(menu, /\.unban <phone number>/);
-  assert.match(menu, /\.ai on\/off/);assert.doesNotMatch(menu, /\.translate|\.sticker|\.toimg/);
+  assert.match(menu, /\.ai on\/off/);
+  assert.doesNotMatch(menu, /\.translate|\.sticker|\.toimg/);
   assert.match(menu, /does not add/i);
 });
 
