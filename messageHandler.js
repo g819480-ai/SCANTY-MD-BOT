@@ -182,6 +182,7 @@ function menuText() {
   ].join('\n');
 }
 
+
 async function generateGeminiReply(userText) {
   const apiKey = process.env.GEMINI_API_KEY;
 
@@ -189,25 +190,84 @@ async function generateGeminiReply(userText) {
     throw new Error('GEMINI_API_KEY is missing from the environment.');
   }
 
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': apiKey
-      },
-      body: JSON.stringify({
-        systemInstruction: {
-          parts: [{
-            text:
-              'You are SCANTY MD BOT AI assistant. ' +
-              'Answer the user clearly, naturally, helpfully and politely. ' +
-              'Understand the question before answering. ' +
-              'Do not pretend to perform actions you cannot perform. ' +
-              'Keep answers reasonably concise and suitable for WhatsApp.'
-          }]
-        },
+  const models = [
+    ...new Set([GEMINI_MODEL, ...GEMINI_FALLBACK_MODELS])
+  ];
+
+  const temporaryErrors = [429, 500, 502, 503, 504];
+  let lastError;
+
+  for (const model of models) {
+    try {
+      console.log('GEMINI REQUEST:', { model });
+
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': apiKey
+          },
+          body: JSON.stringify({
+            systemInstruction: {
+              parts: [{
+                text:
+                  'You are SCANTY MD BOT AI assistant. ' +
+                  'Answer the user clearly, naturally, helpfully and politely. ' +
+                  'Understand the question before answering. ' +
+                  'Do not pretend to perform actions you cannot perform. ' +
+                  'Keep answers reasonably concise and suitable for WhatsApp.'
+              }]
+            },
+          
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        const error = new Error(
+          data?.error?.message || `Gemini API error (${response.status}).`
+        );
+
+        error.status = response.status;
+
+        throw error;
+      }
+
+      const answer = data?.candidates?.[0]?.content?.parts
+        ?.map(part => part.text || '')
+        .join('')
+        .trim();
+
+      if (!answer) {
+        throw new Error('Gemini returned an empty response.');
+      }
+
+      console.log('GEMINI RESPONSE SUCCESS:', { model });
+
+      return answer.slice(0, 4000);
+
+    } catch (error) {
+      lastError = error;
+
+      const shouldFallbac
+
+      if (!shouldFallback) {
+        throw error;
+      }
+
+      console.warn(
+        `Trying the next Gemini model after ${model} failed.`
+      );
+    }
+  }
+
+  throw new Error(
+    `All Gemini models are temporarily unavailable. ${
+      lastError?.message || ''
+    }`
+  );
+}
+
         contents: [{
           role: 'user',
           parts: [{ text: userText.slice(0, 4000) }]
