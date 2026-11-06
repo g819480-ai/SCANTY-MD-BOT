@@ -1,4 +1,3 @@
-
 import makeWASocket, {
   initAuthCreds,
   BufferJSON,
@@ -88,7 +87,9 @@ const QR_VALIDITY_MS = 30_000;
 
 function clearQrExpiryTimer(userId) {
   const timer = qrExpiryTimers.get(userId);
+
   if (timer) clearTimeout(timer);
+
   qrExpiryTimers.delete(userId);
 }
 
@@ -135,9 +136,10 @@ function expireQrSession(userId, expectedSocket, expectedExpiresAt) {
   } catch {}
 
   console.log('WHATSAPP QR EXPIRED:', { userId });
+
   return true;
 }
-  
+
 function encrypt(value) {
   const iv = crypto.randomBytes(12);
 
@@ -266,6 +268,64 @@ function stopPresenceHeartbeat(userId) {
     clearInterval(timer);
     presenceTimers.delete(userId);
   }
+}
+
+/*
+ * Cleans up an abandoned pairing socket.
+ * It never removes saved encrypted credentials.
+ * It refuses to replace a connected or registered session.
+ */
+function cleanupStalePairingSocket(userId) {
+  const existingSocket = sessions.get(userId);
+
+  if (!existingSocket) return true;
+
+  const existingStatus = sessionStatus.get(userId);
+  const existingContext = reconnectContexts.get(userId);
+  const existingController = reconnectControllers.get(userId);
+
+  if (
+    existingStatus === 'connected' ||
+    existingContext?.state?.creds?.registered === true
+  ) {
+    return false;
+  }
+
+  existingController?.stop();
+
+  clearQrExpiryTimer(userId);
+  stopPresenceHeartbeat(userId);
+
+  if (sessions.get(userId) === existingSocket) {
+    sessions.delete(userId);
+  }
+
+  if (
+    existingController &&
+    reconnectControllers.get(userId) === existingController
+  ) {
+    reconnectControllers.delete(userId);
+  }
+
+  if (
+    existingContext &&
+    reconnectContexts.get(userId) === existingContext
+  ) {
+    reconnectContexts.delete(userId);
+  }
+
+  qrStates.delete(userId);
+  sessionStatus.set(userId, 'disconnected');
+
+  try {
+    existingSocket.end(
+      new Error('Replacing abandoned WhatsApp pairing attempt.')
+    );
+  } catch {}
+
+  console.log('STALE WHATSAPP SESSION CLEANED:', { userId });
+
+  return true;
 }
 
 async function updatePresence(userId, sock) {
@@ -599,8 +659,6 @@ async function attachSocket(
 
     if (sessions.get(userId) !== sock) return;
 
-    // Notify the pairing flow from this original listener.
-    // This avoids missing an early QR event.
     if (typeof onConnectionUpdate === 'function') {
       try {
         onConnectionUpdate(update);
@@ -616,39 +674,39 @@ async function attachSocket(
       lastDisconnect?.error?.output?.statusCode;
 
     if (captureQr && qr) {
-  clearQrExpiryTimer(userId);
+      clearQrExpiryTimer(userId);
 
-  const expiresAt = Date.now() + QR_VALIDITY_MS;
+      const expiresAt = Date.now() + QR_VALIDITY_MS;
 
-  qrStates.set(userId, {
-    qr: normalizeQrValue(qr),
-    status: 'qr',
-    updatedAt: Date.now(),
-    expiresAt
-  });
+      qrStates.set(userId, {
+        qr: normalizeQrValue(qr),
+        status: 'qr',
+        updatedAt: Date.now(),
+        expiresAt
+      });
 
-  const expiryTimer = setTimeout(() => {
-    expireQrSession(userId, sock, expiresAt);
-  }, QR_VALIDITY_MS);
+      const expiryTimer = setTimeout(() => {
+        expireQrSession(userId, sock, expiresAt);
+      }, QR_VALIDITY_MS);
 
-  qrExpiryTimers.set(userId, expiryTimer);
-}
+      qrExpiryTimers.set(userId, expiryTimer);
+    }
 
     if (connection === 'open') {
       controller.connected();
       sessionStatus.set(userId, 'connected');
 
       if (captureQr) {
-  clearQrExpiryTimer(userId);
+        clearQrExpiryTimer(userId);
 
-  qrStates.set(userId, {
-    qr: null,
-    status: 'connected',
-    updatedAt: Date.now(),
-    expiresAt: null,
-    remainingSeconds: null
-  });
-}
+        qrStates.set(userId, {
+          qr: null,
+          status: 'connected',
+          updatedAt: Date.now(),
+          expiresAt: null,
+          remainingSeconds: null
+        });
+      }
 
       console.log(`WhatsApp connected for user ${userId}`);
 
@@ -837,12 +895,6 @@ export async function startUserQrSession(userId) {
         throw new Error('Invalid user ID.');
       }
 
-      if (sessions.has(userId)) {
-        throw new Error(
-          'A WhatsApp session is already active for this user.'
-        );
-      }
-
       const savedCreds = await readRecord(
         userId,
         'creds',
@@ -855,8 +907,18 @@ export async function startUserQrSession(userId) {
         );
       }
 
+      const cleaned = cleanupStalePairingSocket(userId);
+
+      if (!cleaned) {
+        throw new Error(
+          'This WhatsApp account is already connected.'
+        );
+      }
+
       const state = makeAuthState(userId, savedCreds);
+
       clearQrExpiryTimer(userId);
+
       qrStates.set(userId, {
         qr: null,
         status: 'connecting',
@@ -888,12 +950,6 @@ export async function startUserSession(
           'Enter your country code and phone number using digits only.'
         );
       }
-     clearQrExpiryTimer(userId);
-      if (sessions.has(userId)) {
-        throw new Error(
-          'A WhatsApp session is already active for this user.'
-        );
-      }
 
       const savedCreds = await readRecord(
         userId,
@@ -901,49 +957,21 @@ export async function startUserSession(
         'main'
       );
 
-      const existingSocket = sessions.get(userId);
+      if (savedCreds?.registered) {
+        throw new Error(
+          'This WhatsApp account is already linked.'
+        );
+      }
 
-if (existingSocket) {
-  const existingStatus = sessionStatus.get(userId);
-  const existingContext = reconnectContexts.get(userId);
-  const existingController = reconnectControllers.get(userId);
+      const cleaned = cleanupStalePairingSocket(userId);
 
-  if (
-    existingStatus === 'connected' ||
-    existingContext?.state?.creds?.registered === true
-  ) {
-    throw new Error(
-      'This WhatsApp account is already connected.'
-    );
-  }
+      if (!cleaned) {
+        throw new Error(
+          'This WhatsApp account is already connected.'
+        );
+      }
 
-  existingController?.stop();
-  clearQrExpiryTimer(userId);
-  stopPresenceHeartbeat(userId);
-
-  if (sessions.get(userId) === existingSocket) {
-    sessions.delete(userId);
-  }
-
-  if (existingController &&
-      reconnectControllers.get(userId) === existingController) {
-    reconnectControllers.delete(userId);
-  }
-
-  if (existingContext &&
-      reconnectContexts.get(userId) === existingContext) {
-    reconnectContexts.delete(userId);
-  }
-
-  sessionStatus.set(userId, 'disconnected');
-
-  try {
-    existingSocket.end(
-      new Error('Replacing previous QR pairing attempt.')
-    );
-  } catch {}
-}
-
+      clearQrExpiryTimer(userId);
       qrStates.delete(userId);
 
       const state = makeAuthState(userId, savedCreds);
@@ -976,7 +1004,6 @@ if (existingSocket) {
           );
         }
 
-        // Allow the WhatsApp handshake to settle.
         await new Promise(resolve => setTimeout(resolve, 3000));
 
         if (sessions.get(userId) !== sock) {
@@ -1043,9 +1070,7 @@ if (existingSocket) {
 
         try {
           sock?.end(error);
-        } catch {
-          // Socket may already be closed.
-        }
+        } catch {}
 
         console.error('PAIRING REQUEST FAILED:', {
           userId,
@@ -1058,5 +1083,3 @@ if (existingSocket) {
     }
   );
 }
-
-      
