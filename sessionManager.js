@@ -21,6 +21,7 @@ import {
   cleanupExhaustedReconnect,
   createReconnectController,
   reconnectIfCurrent,
+  waitForSocketReady,
   withPairingLock
 } from './whatsappLifecycle.js';
 
@@ -805,62 +806,12 @@ export async function startUserSession(
       const state = makeAuthState(userId, savedCreds);
 
       let sock = null;
-      let readinessTimer = null;
-      let readinessResolve;
-      let readinessReject;
-      let readinessSettled = false;
-
-      const pairingReady = new Promise((resolve, reject) => {
-        readinessResolve = resolve;
-        readinessReject = reject;
-
-        readinessTimer = setTimeout(() => {
-          finishReadiness(
-            new Error(
-              'Timed out waiting for WhatsApp pairing readiness. Please try again.'
-            )
-          );
-        }, 45000);
-      });
-
-      function finishReadiness(error) {
-        if (readinessSettled) return;
-
-        readinessSettled = true;
-
-        if (readinessTimer) {
-          clearTimeout(readinessTimer);
-          readinessTimer = null;
-        }
-
-        if (error) {
-          readinessReject(error);
-        } else {
-          readinessResolve();
-        }
-      }
 
       try {
         sock = await attachSocket(
           userId,
           state,
-          false,
-          null,
-          null,
-          update => {
-            if (update.qr) {
-              finishReadiness();
-              return;
-            }
-
-            if (update.connection === 'close') {
-              finishReadiness(
-                new Error(
-                  'WhatsApp connection closed before the pairing code could be requested. Please try again later.'
-                )
-              );
-            }
-          }
+          false
         );
 
         if (!sock) {
@@ -869,15 +820,31 @@ export async function startUserSession(
           );
         }
 
-        await pairingReady;
+        console.log(
+          'Waiting for WhatsApp WebSocket readiness:',
+          userId
+        );
+
+        await waitForSocketReady(sock, 30000);
 
         if (sessions.get(userId) !== sock) {
           throw new Error(
-            'WhatsApp socket is no longer active.'
+            'WhatsApp connection changed before pairing.'
           );
         }
 
-        const code = await sock.requestPairingCode(phoneNumber);
+        // Allow the WhatsApp handshake to settle.
+        await new Promise(resolve => setTimeout(resolve, 3000));
+
+        if (sessions.get(userId) !== sock) {
+          throw new Error(
+            'WhatsApp connection closed before pairing.'
+          );
+        }
+
+        const code = await sock.requestPairingCode(
+          phoneNumber
+        );
 
         if (!code) {
           throw new Error(
@@ -889,37 +856,47 @@ export async function startUserSession(
           onPairingCode(code);
         }
 
+        console.log(
+          'WHATSAPP PAIRING CODE GENERATED:',
+          userId
+        );
+
         return {
           started: true
         };
       } catch (error) {
-        finishReadiness(error);
-
         stopPresenceHeartbeat(userId);
 
         const activeController =
           reconnectControllers.get(userId);
 
-        activeController?.stop();
-
-        if (
-          reconnectControllers.get(userId) === activeController
-        ) {
-          reconnectControllers.delete(userId);
-        }
-
         const activeContext =
           reconnectContexts.get(userId);
 
-        if (activeContext?.controller === activeController) {
+        if (
+          activeController &&
+          activeContext?.controller === activeController &&
+          activeContext.captureQr === false &&
+          (
+            !sock ||
+            activeContext.expectedSocket === sock
+          )
+        ) {
+          activeController.stop();
+          reconnectControllers.delete(userId);
           reconnectContexts.delete(userId);
         }
 
-        if (sessions.get(userId) === sock) {
+        if (sock && sessions.get(userId) === sock) {
           sessions.delete(userId);
         }
 
-        sessionStatus.set(userId, 'disconnected');
+        if (
+          !sock ||
+          sessions.get(userId) === undefined
+        ) {
+          sessionStatus.set(userId, 'disconnected');
+        }
 
         try {
           sock?.end(error);
@@ -934,11 +911,9 @@ export async function startUserSession(
         });
 
         throw error;
-      } finally {
-        if (readinessTimer) {
-          clearTimeout(readinessTimer);
-        }
       }
     }
   );
 }
+
+      
