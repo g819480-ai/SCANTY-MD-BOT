@@ -10,7 +10,7 @@ import {
   startUserSession,
   startUserQrSession,
   getUserQrState,
-  getQrMonitoringStates, 
+  getQrMonitoringStates,
   getUserSessionStatus,
   restoreUserSessions
 } from './sessionManager.js';
@@ -173,12 +173,12 @@ function isVisitor(user) {
 
 const rateLimits = new Map();
 
-function rateLimit(req, res, limit = 20) {
-  const key = `${req.socket.remoteAddress}:${req.url}`;
+function rateLimit(req, res, limit = 20, windowMs = 60000) {
+  const key = `${req.socket.remoteAddress}:${req.method}:${req.url}`;
   const now = Date.now();
   const previous = rateLimits.get(key);
 
-  if (!previous || now - previous.start > 60000) {
+  if (!previous || now - previous.start >= windowMs) {
     rateLimits.set(key, { start: now, count: 1 });
     return false;
   }
@@ -616,13 +616,13 @@ async function handleRequest(req, res) {
     }
   }
 
-  // WHATSAPP QR PAIRING
+  // WHATSAPP QR GENERATION
 
   if (
     req.method === 'POST' &&
     url.pathname === '/api/whatsapp/qr'
   ) {
-    if (rateLimit(req, res, 200)) return;
+    if (rateLimit(req, res, 200, 30000)) return;
 
     const user = await authenticatedUser(req);
 
@@ -649,11 +649,13 @@ async function handleRequest(req, res) {
     }
   }
 
+  // WHATSAPP QR STATUS POLLING
+
   if (
     req.method === 'GET' &&
     url.pathname === '/api/whatsapp/qr'
   ) {
-    if (rateLimit(req, res, 60)) return;
+    if (rateLimit(req, res, 200, 30000)) return;
 
     const user = await authenticatedUser(req);
 
@@ -675,7 +677,7 @@ async function handleRequest(req, res) {
     req.method === 'POST' &&
     url.pathname === '/api/whatsapp/pair'
   ) {
-    if (rateLimit(req, res, 200)) return;
+    if (rateLimit(req, res, 200, 30000)) return;
 
     const user = await authenticatedUser(req);
 
@@ -735,20 +737,23 @@ async function handleRequest(req, res) {
     }
   }
 
-  // ADMIN OVERVIEW AND EXISTING NON-GUEST USERS
-// ADMIN: QR SESSION MONITORING (NEVER RETURNS QR PAYLOADS)
-if (
-  req.method === 'GET' &&
-  url.pathname === '/api/admin/qr-sessions'
-) {
-  const admin = await requireAdmin(req, res);
-  if (!admin) return;
+  // ADMIN: QR SESSION MONITORING
 
-  return send(res, 200, {
-    success: true,
-    sessions: getQrMonitoringStates()
-  });
-}
+  if (
+    req.method === 'GET' &&
+    url.pathname === '/api/admin/qr-sessions'
+  ) {
+    const admin = await requireAdmin(req, res);
+    if (!admin) return;
+
+    return send(res, 200, {
+      success: true,
+      sessions: getQrMonitoringStates()
+    });
+  }
+
+  // ADMIN STATS AND USERS
+
   if (
     req.method === 'GET' &&
     (
@@ -942,7 +947,7 @@ if (
       }
     }
 
-    // ADMIN LISTS BANNED NUMBERS FOR A VISITOR BOT
+    // ADMIN LISTS BANNED NUMBERS
 
     if (
       req.method === 'GET' &&
@@ -962,7 +967,7 @@ if (
       }
     }
 
-    // ADMIN BANS A NUMBER FROM A VISITOR BOT
+    // ADMIN BANS A NUMBER
 
     if (
       req.method === 'POST' &&
@@ -999,7 +1004,7 @@ if (
       }
     }
 
-    // ADMIN UNBANS A NUMBER FROM A VISITOR BOT
+    // ADMIN UNBANS A NUMBER
 
     if (
       req.method === 'POST' &&
