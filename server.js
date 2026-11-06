@@ -12,7 +12,8 @@ import {
   getUserQrState,
   getQrMonitoringStates,
   getUserSessionStatus,
-  restoreUserSessions
+  restoreUserSessions,
+  closeSessionManagerGracefully
 } from './sessionManager.js';
 
 import {
@@ -64,6 +65,7 @@ const pool = new Pool({
   max: 5,
   connectionTimeoutMillis: 10000
 });
+
 const ALLOWED_SETTINGS = [
   'alwaysOnline',
   'autoViewStatus',
@@ -89,12 +91,29 @@ const BOOLEAN_SETTINGS = [
   'aiChatEnabled'
 ];
 
+/*
+|--------------------------------------------------------------------------
+| SERVER LIFECYCLE
+|--------------------------------------------------------------------------
+*/
+
+let httpServer = null;
+let shuttingDown = false;
+
 function send(res, status, data) {
+  if (res.headersSent) {
+    try {
+      res.end();
+    } catch {}
+    return;
+  }
+
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff'
   });
+
   res.end(JSON.stringify(data));
 }
 
@@ -107,7 +126,10 @@ function readBody(req) {
 
       if (body.length > 10000) {
         reject(new Error('Request body too large'));
-        req.destroy();
+
+        try {
+          req.destroy();
+        } catch {}
       }
     });
 
@@ -133,7 +155,10 @@ function createToken(user, isGuest = false) {
 
 function getToken(req) {
   const header = req.headers.authorization || '';
-  return header.startsWith('Bearer ') ? header.slice(7) : null;
+
+  return header.startsWith('Bearer ')
+    ? header.slice(7)
+    : null;
 }
 
 async function authenticatedUser(req) {
@@ -146,7 +171,8 @@ async function authenticatedUser(req) {
 
     const result = await pool.query(
       `SELECT id, email, role, is_guest, created_at
-       FROM users WHERE id = $1`,
+       FROM users
+       WHERE id = $1`,
       [decoded.userId]
     );
 
@@ -174,6 +200,12 @@ function isVisitor(user) {
   return Boolean(user && user.is_guest);
 }
 
+/*
+|--------------------------------------------------------------------------
+| RATE LIMITING
+|--------------------------------------------------------------------------
+*/
+
 const rateLimits = new Map();
 
 function rateLimit(req, res, limit = 20, windowMs = 60000) {
@@ -182,7 +214,11 @@ function rateLimit(req, res, limit = 20, windowMs = 60000) {
   const previous = rateLimits.get(key);
 
   if (!previous || now - previous.start >= windowMs) {
-    rateLimits.set(key, { start: now, count: 1 });
+    rateLimits.set(key, {
+      start: now,
+      count: 1
+    });
+
     return false;
   }
 
@@ -192,11 +228,18 @@ function rateLimit(req, res, limit = 20, windowMs = 60000) {
     send(res, 429, {
       error: 'Too many requests. Please try again later.'
     });
+
     return true;
   }
 
   return false;
 }
+
+/*
+|--------------------------------------------------------------------------
+| DATABASE INITIALIZATION
+|--------------------------------------------------------------------------
+*/
 
 async function initializeDatabase() {
   await pool.query(`
@@ -219,24 +262,39 @@ async function initializeDatabase() {
   `);
 
   await pool.query(`
-    UPDATE users SET role = 'user'
-    WHERE role IS NULL OR role NOT IN ('user', 'admin')
+    UPDATE users
+    SET role = 'user'
+    WHERE role IS NULL
+       OR role NOT IN ('user', 'admin')
   `);
 
-  const passwordHash = await bcrypt.hash(ADMIN_PASSWORD, 12);
+  const passwordHash = await bcrypt.hash(
+    ADMIN_PASSWORD,
+    12
+  );
 
   await pool.query(
-    `INSERT INTO users (email, password_hash, role, is_guest)
+    `INSERT INTO users
+      (email, password_hash, role, is_guest)
      VALUES ($1, $2, 'admin', FALSE)
      ON CONFLICT (email) DO UPDATE SET
        password_hash = EXCLUDED.password_hash,
        role = 'admin',
        is_guest = FALSE`,
-    [ADMIN_EMAIL, passwordHash]
+    [
+      ADMIN_EMAIL,
+      passwordHash
+    ]
   );
 
   console.log('Database initialized.');
 }
+
+/*
+|--------------------------------------------------------------------------
+| AUTHORIZATION
+|--------------------------------------------------------------------------
+*/
 
 async function requireAdmin(req, res) {
   const user = await authenticatedUser(req);
@@ -245,6 +303,7 @@ async function requireAdmin(req, res) {
     send(res, 403, {
       error: 'Administrator access required.'
     });
+
     return null;
   }
 
@@ -258,6 +317,7 @@ async function requireVisitor(req, res) {
     send(res, 401, {
       error: 'A valid visitor pairing session is required.'
     });
+
     return null;
   }
 
@@ -272,12 +332,19 @@ async function findVisitor(visitorId) {
   const result = await pool.query(
     `SELECT id, created_at
      FROM users
-     WHERE id = $1 AND is_guest = TRUE`,
+     WHERE id = $1
+       AND is_guest = TRUE`,
     [visitorId]
   );
 
   return result.rows[0] || null;
 }
+
+/*
+|--------------------------------------------------------------------------
+| BOT SETTINGS
+|--------------------------------------------------------------------------
+*/
 
 async function updateSettings(userId, body) {
   if (
@@ -296,14 +363,18 @@ async function updateSettings(userId, body) {
 
   for (const key of keys) {
     if (!ALLOWED_SETTINGS.includes(key)) {
-      throw new Error(`Setting "${key}" is not allowed.`);
+      throw new Error(
+        `Setting "${key}" is not allowed.`
+      );
     }
 
     if (
       BOOLEAN_SETTINGS.includes(key) &&
       typeof body[key] !== 'boolean'
     ) {
-      throw new Error(`${key} must be true or false.`);
+      throw new Error(
+        `${key} must be true or false.`
+      );
     }
   }
 
@@ -320,7 +391,19 @@ async function updateSettings(userId, body) {
   return settings;
 }
 
+/*
+|--------------------------------------------------------------------------
+| HTTP REQUEST HANDLER
+|--------------------------------------------------------------------------
+*/
+
 async function handleRequest(req, res) {
+  if (shuttingDown) {
+    return send(res, 503, {
+      error: 'Server is shutting down. Please try again shortly.'
+    });
+  }
+
   const origin = req.headers.origin;
 
   console.log('CORS CHECK:', {
@@ -335,7 +418,11 @@ async function handleRequest(req, res) {
       'Access-Control-Allow-Origin',
       DASHBOARD_ORIGIN
     );
-    res.setHeader('Vary', 'Origin');
+
+    res.setHeader(
+      'Vary',
+      'Origin'
+    );
   }
 
   res.setHeader(
@@ -348,10 +435,16 @@ async function handleRequest(req, res) {
     'Content-Type, Authorization'
   );
 
-  res.setHeader('Access-Control-Max-Age', '600');
+  res.setHeader(
+    'Access-Control-Max-Age',
+    '600'
+  );
 
   if (req.method === 'OPTIONS') {
-    if (origin && origin !== DASHBOARD_ORIGIN) {
+    if (
+      origin &&
+      origin !== DASHBOARD_ORIGIN
+    ) {
       return send(res, 403, {
         error: 'Origin not allowed.'
       });
@@ -361,7 +454,10 @@ async function handleRequest(req, res) {
     return res.end();
   }
 
-  if (origin && origin !== DASHBOARD_ORIGIN) {
+  if (
+    origin &&
+    origin !== DASHBOARD_ORIGIN
+  ) {
     return send(res, 403, {
       error: 'Origin not allowed.'
     });
@@ -372,9 +468,16 @@ async function handleRequest(req, res) {
     `http://${req.headers.host || 'localhost'}`
   );
 
-  // PUBLIC HEALTH ROUTES
+  /*
+  |--------------------------------------------------------------------------
+  | PUBLIC HEALTH ROUTES
+  |--------------------------------------------------------------------------
+  */
 
-  if (req.method === 'GET' && url.pathname === '/') {
+  if (
+    req.method === 'GET' &&
+    url.pathname === '/'
+  ) {
     return send(res, 200, {
       success: true,
       name: 'SCANTY MD BOT',
@@ -382,13 +485,19 @@ async function handleRequest(req, res) {
     });
   }
 
-  if (req.method === 'GET' && url.pathname === '/health') {
+  if (
+    req.method === 'GET' &&
+    url.pathname === '/health'
+  ) {
     return send(res, 200, {
       status: 'online'
     });
   }
 
-  if (req.method === 'GET' && url.pathname === '/db-health') {
+  if (
+    req.method === 'GET' &&
+    url.pathname === '/db-health'
+  ) {
     try {
       await pool.query('SELECT NOW()');
 
@@ -397,7 +506,10 @@ async function handleRequest(req, res) {
         database: 'Neon PostgreSQL'
       });
     } catch (error) {
-      console.error('Database health error:', error.message);
+      console.error(
+        'Database health error:',
+        error.message
+      );
 
       return send(res, 503, {
         status: 'disconnected'
@@ -405,32 +517,55 @@ async function handleRequest(req, res) {
     }
   }
 
-  // PRIVATE VISITOR SESSION CREATION
+  /*
+  |--------------------------------------------------------------------------
+  | PUBLIC VISITOR SESSION CREATION
+  |--------------------------------------------------------------------------
+  */
 
   if (
     req.method === 'POST' &&
     url.pathname === '/api/public/session'
   ) {
-    if (rateLimit(req, res, 200)) return;
+    if (rateLimit(req, res, 200)) {
+      return;
+    }
 
     try {
       const guestId = crypto.randomUUID();
-      const guestEmail = `guest-${guestId}@guest.scanty.invalid`;
-      const randomPassword = crypto.randomBytes(48).toString('hex');
-      const passwordHash = await bcrypt.hash(randomPassword, 10);
+
+      const guestEmail =
+        `guest-${guestId}@guest.scanty.invalid`;
+
+      const randomPassword =
+        crypto.randomBytes(48).toString('hex');
+
+      const passwordHash =
+        await bcrypt.hash(
+          randomPassword,
+          10
+        );
 
       const result = await pool.query(
         `INSERT INTO users
           (id, email, password_hash, role, is_guest)
          VALUES ($1, $2, $3, 'user', TRUE)
          RETURNING id`,
-        [guestId, guestEmail, passwordHash]
+        [
+          guestId,
+          guestEmail,
+          passwordHash
+        ]
       );
 
       return send(res, 201, {
         success: true,
-        token: createToken(result.rows[0], true),
-        message: 'Private pairing session created.'
+        token: createToken(
+          result.rows[0],
+          true
+        ),
+        message:
+          'Private pairing session created.'
       });
     } catch (error) {
       console.error(
@@ -439,12 +574,17 @@ async function handleRequest(req, res) {
       );
 
       return send(res, 500, {
-        error: 'Could not create a pairing session. Please try again.'
+        error:
+          'Could not create a pairing session. Please try again.'
       });
     }
   }
 
-  // PUBLIC REGISTRATION IS DISABLED
+  /*
+  |--------------------------------------------------------------------------
+  | PUBLIC REGISTRATION DISABLED
+  |--------------------------------------------------------------------------
+  */
 
   if (
     req.method === 'POST' &&
@@ -455,13 +595,19 @@ async function handleRequest(req, res) {
     });
   }
 
-  // ADMIN LOGIN
+  /*
+  |--------------------------------------------------------------------------
+  | ADMIN LOGIN
+  |--------------------------------------------------------------------------
+  */
 
   if (
     req.method === 'POST' &&
     url.pathname === '/api/auth/login'
   ) {
-    if (rateLimit(req, res, 200)) return;
+    if (rateLimit(req, res, 200)) {
+      return;
+    }
 
     let body;
 
@@ -473,8 +619,13 @@ async function handleRequest(req, res) {
       });
     }
 
-    const email = String(body.email || '').trim().toLowerCase();
-    const password = body.password;
+    const email =
+      String(body.email || '')
+        .trim()
+        .toLowerCase();
+
+    const password =
+      body.password;
 
     if (
       email !== ADMIN_EMAIL ||
@@ -483,15 +634,20 @@ async function handleRequest(req, res) {
       Buffer.byteLength(password, 'utf8') > 72
     ) {
       return send(res, 401, {
-        error: 'Incorrect administrator email or password.'
+        error:
+          'Incorrect administrator email or password.'
       });
     }
 
     try {
       const result = await pool.query(
-        `SELECT id, email, password_hash, role
+        `SELECT id,
+                email,
+                password_hash,
+                role
          FROM users
-         WHERE email = $1 AND is_guest = FALSE`,
+         WHERE email = $1
+           AND is_guest = FALSE`,
         [ADMIN_EMAIL]
       );
 
@@ -500,16 +656,21 @@ async function handleRequest(req, res) {
       if (
         !user ||
         user.role !== 'admin' ||
-        !(await bcrypt.compare(password, user.password_hash))
+        !(await bcrypt.compare(
+          password,
+          user.password_hash
+        ))
       ) {
         return send(res, 401, {
-          error: 'Incorrect administrator email or password.'
+          error:
+            'Incorrect administrator email or password.'
         });
       }
 
       return send(res, 200, {
         success: true,
-        message: 'Administrator login successful.',
+        message:
+          'Administrator login successful.',
         user: {
           id: user.id,
           email: user.email,
@@ -518,23 +679,34 @@ async function handleRequest(req, res) {
         token: createToken(user)
       });
     } catch (error) {
-      console.error('Admin login error:', error.message);
+      console.error(
+        'Admin login error:',
+        error.message
+      );
 
       return send(res, 500, {
-        error: 'Administrator login could not be completed.'
+        error:
+          'Administrator login could not be completed.'
       });
     }
   }
 
-  // ADMIN IDENTITY
+  /*
+  |--------------------------------------------------------------------------
+  | ADMIN IDENTITY
+  |--------------------------------------------------------------------------
+  */
 
   if (
     req.method === 'GET' &&
     url.pathname === '/api/auth/me'
   ) {
-    const user = await requireAdmin(req, res);
+    const user =
+      await requireAdmin(req, res);
 
-    if (!user) return;
+    if (!user) {
+      return;
+    }
 
     return send(res, 200, {
       success: true,
@@ -546,92 +718,141 @@ async function handleRequest(req, res) {
     });
   }
 
-  // VISITOR PRIVATE DASHBOARD IDENTITY
+  /*
+  |--------------------------------------------------------------------------
+  | VISITOR IDENTITY
+  |--------------------------------------------------------------------------
+  */
 
   if (
     req.method === 'GET' &&
     url.pathname === '/api/visitor/me'
   ) {
-    const user = await requireVisitor(req, res);
+    const user =
+      await requireVisitor(req, res);
 
-    if (!user) return;
+    if (!user) {
+      return;
+    }
 
     return send(res, 200, {
       success: true,
       visitor: {
         id: user.id,
         createdAt: user.created_at,
-        connectionStatus: getUserSessionStatus(user.id)
+        connectionStatus:
+          getUserSessionStatus(user.id)
       }
     });
   }
 
-  // VISITOR READS THEIR OWN SETTINGS
+  /*
+  |--------------------------------------------------------------------------
+  | VISITOR SETTINGS - GET
+  |--------------------------------------------------------------------------
+  */
 
   if (
     req.method === 'GET' &&
     url.pathname === '/api/visitor/settings'
   ) {
-    const user = await requireVisitor(req, res);
+    const user =
+      await requireVisitor(req, res);
 
-    if (!user) return;
+    if (!user) {
+      return;
+    }
 
     try {
       return send(res, 200, {
         success: true,
-        settings: await getFeatureSettings(user.id)
+        settings:
+          await getFeatureSettings(user.id)
       });
     } catch (error) {
-      console.error('Visitor settings error:', error.message);
+      console.error(
+        'Visitor settings error:',
+        error.message
+      );
 
       return send(res, 500, {
-        error: 'Could not load your bot settings.'
+        error:
+          'Could not load your bot settings.'
       });
     }
   }
 
-  // VISITOR UPDATES THEIR OWN SETTINGS
+  /*
+  |--------------------------------------------------------------------------
+  | VISITOR SETTINGS - UPDATE
+  |--------------------------------------------------------------------------
+  */
 
   if (
     req.method === 'POST' &&
     url.pathname === '/api/visitor/settings'
   ) {
-    const user = await requireVisitor(req, res);
+    const user =
+      await requireVisitor(req, res);
 
-    if (!user) return;
+    if (!user) {
+      return;
+    }
 
     let body;
 
     try {
       body = await readBody(req);
 
-      const settings = await updateSettings(user.id, body);
+      const settings =
+        await updateSettings(
+          user.id,
+          body
+        );
 
       return send(res, 200, {
         success: true,
-        message: 'Your bot settings have been updated.',
+        message:
+          'Your bot settings have been updated.',
         settings
       });
     } catch (error) {
       return send(res, 400, {
-        error: error.message || 'Could not update your settings.'
+        error:
+          error.message ||
+          'Could not update your settings.'
       });
     }
   }
 
-  // WHATSAPP QR GENERATION
+  /*
+  |--------------------------------------------------------------------------
+  | WHATSAPP QR GENERATION
+  |--------------------------------------------------------------------------
+  */
 
   if (
     req.method === 'POST' &&
     url.pathname === '/api/whatsapp/qr'
   ) {
-    if (rateLimit(req, res, 200, 30000)) return;
+    if (
+      rateLimit(
+        req,
+        res,
+        200,
+        30000
+      )
+    ) {
+      return;
+    }
 
-    const user = await authenticatedUser(req);
+    const user =
+      await authenticatedUser(req);
 
     if (!user) {
       return send(res, 401, {
-        error: 'Create a pairing session before connecting WhatsApp.'
+        error:
+          'Create a pairing session before connecting WhatsApp.'
       });
     }
 
@@ -640,31 +861,52 @@ async function handleRequest(req, res) {
 
       return send(res, 202, {
         success: true,
-        message: 'QR pairing started. Waiting for WhatsApp QR code.',
+        message:
+          'QR pairing started. Waiting for WhatsApp QR code.',
         ...getUserQrState(user.id)
       });
     } catch (error) {
-      console.error('WhatsApp QR start error:', error.message);
+      console.error(
+        'WhatsApp QR start error:',
+        error.message
+      );
 
       return send(res, 400, {
-        error: error.message || 'Could not start QR pairing.'
+        error:
+          error.message ||
+          'Could not start QR pairing.'
       });
     }
   }
 
-  // WHATSAPP QR STATUS POLLING
+  /*
+  |--------------------------------------------------------------------------
+  | WHATSAPP QR STATUS POLLING
+  |--------------------------------------------------------------------------
+  */
 
   if (
     req.method === 'GET' &&
     url.pathname === '/api/whatsapp/qr'
   ) {
-    if (rateLimit(req, res, 200, 30000)) return;
+    if (
+      rateLimit(
+        req,
+        res,
+        200,
+        30000
+      )
+    ) {
+      return;
+    }
 
-    const user = await authenticatedUser(req);
+    const user =
+      await authenticatedUser(req);
 
     if (!user) {
       return send(res, 401, {
-        error: 'Create a pairing session before checking WhatsApp pairing.'
+        error:
+          'Create a pairing session before checking WhatsApp pairing.'
       });
     }
 
@@ -674,19 +916,34 @@ async function handleRequest(req, res) {
     });
   }
 
-  // WHATSAPP PHONE PAIRING
+  /*
+  |--------------------------------------------------------------------------
+  | WHATSAPP PHONE PAIRING
+  |--------------------------------------------------------------------------
+  */
 
   if (
     req.method === 'POST' &&
     url.pathname === '/api/whatsapp/pair'
   ) {
-    if (rateLimit(req, res, 200, 30000)) return;
+    if (
+      rateLimit(
+        req,
+        res,
+        200,
+        30000
+      )
+    ) {
+      return;
+    }
 
-    const user = await authenticatedUser(req);
+    const user =
+      await authenticatedUser(req);
 
     if (!user) {
       return send(res, 401, {
-        error: 'Create a pairing session before connecting WhatsApp.'
+        error:
+          'Create a pairing session before connecting WhatsApp.'
       });
     }
 
@@ -696,16 +953,19 @@ async function handleRequest(req, res) {
       body = await readBody(req);
     } catch {
       return send(res, 400, {
-        error: 'Invalid request body.'
+        error:
+          'Invalid request body.'
       });
     }
 
-    const phoneNumber = String(body.phoneNumber || '')
-      .replace(/[\s+()-]/g, '');
+    const phoneNumber =
+      String(body.phoneNumber || '')
+        .replace(/[\s+()-]/g, '');
 
     if (!/^\d{10,15}$/.test(phoneNumber)) {
       return send(res, 400, {
-        error: 'Enter your phone number with country code, using digits only.'
+        error:
+          'Enter your phone number with country code, using digits only.'
       });
     }
 
@@ -722,40 +982,60 @@ async function handleRequest(req, res) {
 
       if (!pairingCode) {
         return send(res, 500, {
-          error: 'The pairing code could not be generated.'
+          error:
+            'The pairing code could not be generated.'
         });
       }
 
       return send(res, 200, {
         success: true,
-        message: 'Pairing code generated. Enter it in WhatsApp Linked Devices.',
+        message:
+          'Pairing code generated. Enter it in WhatsApp Linked Devices.',
         pairingCode
       });
     } catch (error) {
-      console.error('WhatsApp pairing error:', error.message);
+      console.error(
+        'WhatsApp pairing error:',
+        error.message
+      );
 
       return send(res, 400, {
-        error: error.message || 'Could not start WhatsApp pairing.'
+        error:
+          error.message ||
+          'Could not start WhatsApp pairing.'
       });
     }
   }
 
-  // ADMIN: QR SESSION MONITORING
+  /*
+  |--------------------------------------------------------------------------
+  | ADMIN QR SESSION MONITORING
+  |--------------------------------------------------------------------------
+  */
 
   if (
     req.method === 'GET' &&
     url.pathname === '/api/admin/qr-sessions'
   ) {
-    const admin = await requireAdmin(req, res);
-    if (!admin) return;
+    const admin =
+      await requireAdmin(req, res);
+
+    if (!admin) {
+      return;
+    }
 
     return send(res, 200, {
       success: true,
-      sessions: getQrMonitoringStates()
+      sessions:
+        getQrMonitoringStates()
     });
   }
 
-  // ADMIN STATS AND USERS
+  /*
+  |--------------------------------------------------------------------------
+  | ADMIN STATS / USERS
+  |--------------------------------------------------------------------------
+  */
 
   if (
     req.method === 'GET' &&
@@ -764,151 +1044,226 @@ async function handleRequest(req, res) {
       url.pathname === '/api/admin/users'
     )
   ) {
-    const admin = await requireAdmin(req, res);
+    const admin =
+      await requireAdmin(req, res);
 
-    if (!admin) return;
+    if (!admin) {
+      return;
+    }
 
     try {
-      if (url.pathname === '/api/admin/stats') {
-        const result = await pool.query(`
-          SELECT
-            COUNT(*) FILTER (
-              WHERE is_guest = FALSE
-            )::int AS total_users,
+      if (
+        url.pathname === '/api/admin/stats'
+      ) {
+        const result =
+          await pool.query(`
+            SELECT
+              COUNT(*) FILTER (
+                WHERE is_guest = FALSE
+              )::int AS total_users,
 
-            COUNT(*) FILTER (
-              WHERE role = 'admin' AND is_guest = FALSE
-            )::int AS total_admins,
+              COUNT(*) FILTER (
+                WHERE role = 'admin'
+                  AND is_guest = FALSE
+              )::int AS total_admins,
 
-            COUNT(*) FILTER (
-              WHERE role = 'user' AND is_guest = FALSE
-            )::int AS total_members,
+              COUNT(*) FILTER (
+                WHERE role = 'user'
+                  AND is_guest = FALSE
+              )::int AS total_members,
 
-            COUNT(*) FILTER (
-              WHERE is_guest = TRUE
-            )::int AS total_visitors
+              COUNT(*) FILTER (
+                WHERE is_guest = TRUE
+              )::int AS total_visitors
 
-          FROM users
-        `);
+            FROM users
+          `);
 
-        const connectedResult = await pool.query(`
-          SELECT COUNT(*)::int AS connected_visitors
-          FROM users u
-          WHERE u.is_guest = TRUE
-          AND EXISTS (
-            SELECT 1
-            FROM whatsapp_sessions w
-            WHERE w.user_id = u.id
-              AND w.record_type = 'creds'
-              AND w.record_id = 'main'
-          )
-        `);
+        const connectedResult =
+          await pool.query(`
+            SELECT COUNT(*)::int
+              AS connected_visitors
+
+            FROM users u
+
+            WHERE u.is_guest = TRUE
+
+              AND EXISTS (
+                SELECT 1
+                FROM whatsapp_sessions w
+                WHERE w.user_id = u.id
+                  AND w.record_type = 'creds'
+                  AND w.record_id = 'main'
+              )
+          `);
 
         return send(res, 200, {
           success: true,
           stats: {
             ...result.rows[0],
             connected_visitors:
-              connectedResult.rows[0].connected_visitors
+              connectedResult.rows[0]
+                .connected_visitors
           }
         });
       }
 
-      const result = await pool.query(`
-        SELECT id, email, role, created_at
-        FROM users
-        WHERE is_guest = FALSE
-        ORDER BY created_at DESC
-        LIMIT 100
-      `);
+      const result =
+        await pool.query(`
+          SELECT
+            id,
+            email,
+            role,
+            created_at
+
+          FROM users
+
+          WHERE is_guest = FALSE
+
+          ORDER BY created_at DESC
+
+          LIMIT 100
+        `);
 
       return send(res, 200, {
         success: true,
         users: result.rows
       });
     } catch (error) {
-      console.error('Admin request error:', error.message);
+      console.error(
+        'Admin request error:',
+        error.message
+      );
 
       return send(res, 500, {
-        error: 'Could not load admin data.'
+        error:
+          'Could not load admin data.'
       });
     }
   }
 
-  // ADMIN: LIST ALL VISITORS
+  /*
+  |--------------------------------------------------------------------------
+  | ADMIN VISITOR LIST
+  |--------------------------------------------------------------------------
+  */
 
   if (
     req.method === 'GET' &&
     url.pathname === '/api/admin/visitors'
   ) {
-    const admin = await requireAdmin(req, res);
+    const admin =
+      await requireAdmin(req, res);
 
-    if (!admin) return;
+    if (!admin) {
+      return;
+    }
 
     try {
-      const result = await pool.query(`
-        SELECT id, created_at
-        FROM users
-        WHERE is_guest = TRUE
-        ORDER BY created_at DESC
-        LIMIT 500
-      `);
+      const result =
+        await pool.query(`
+          SELECT
+            id,
+            created_at
 
-      const visitors = result.rows.map(visitor => ({
-        id: visitor.id,
-        createdAt: visitor.created_at,
-        connectionStatus: getUserSessionStatus(visitor.id)
-      }));
+          FROM users
+
+          WHERE is_guest = TRUE
+
+          ORDER BY created_at DESC
+
+          LIMIT 500
+        `);
+
+      const visitors =
+        result.rows.map(visitor => ({
+          id: visitor.id,
+          createdAt: visitor.created_at,
+          connectionStatus:
+            getUserSessionStatus(
+              visitor.id
+            )
+        }));
 
       return send(res, 200, {
         success: true,
         visitors
       });
     } catch (error) {
-      console.error('Visitor list error:', error.message);
+      console.error(
+        'Visitor list error:',
+        error.message
+      );
 
       return send(res, 500, {
-        error: 'Could not load visitors.'
+        error:
+          'Could not load visitors.'
       });
     }
   }
 
-  // ADMIN: MANAGE A SPECIFIC VISITOR
+  /*
+  |--------------------------------------------------------------------------
+  | ADMIN VISITOR MANAGEMENT
+  |--------------------------------------------------------------------------
+  */
 
-  const visitorMatch = url.pathname.match(
-    /^\/api\/admin\/visitors\/([a-f0-9-]{16,64})(?:\/(settings|bans|ban|unban))?$/i
-  );
+  const visitorMatch =
+    url.pathname.match(
+      /^\/api\/admin\/visitors\/([a-f0-9-]{16,64})(?:\/(settings|bans|ban|unban))?$/i
+    );
 
   if (visitorMatch) {
-    const admin = await requireAdmin(req, res);
+    const admin =
+      await requireAdmin(req, res);
 
-    if (!admin) return;
+    if (!admin) {
+      return;
+    }
 
-    const visitorId = visitorMatch[1];
-    const action = visitorMatch[2] || '';
+    const visitorId =
+      visitorMatch[1];
 
-    const visitor = await findVisitor(visitorId);
+    const action =
+      visitorMatch[2] || '';
+
+    const visitor =
+      await findVisitor(
+        visitorId
+      );
 
     if (!visitor) {
       return send(res, 404, {
-        error: 'Visitor not found.'
+        error:
+          'Visitor not found.'
       });
     }
 
-    // ADMIN READS ONE VISITOR
+    /*
+    | ADMIN READS ONE VISITOR
+    */
 
-    if (req.method === 'GET' && action === '') {
+    if (
+      req.method === 'GET' &&
+      action === ''
+    ) {
       return send(res, 200, {
         success: true,
         visitor: {
           id: visitor.id,
-          createdAt: visitor.created_at,
-          connectionStatus: getUserSessionStatus(visitor.id)
+          createdAt:
+            visitor.created_at,
+          connectionStatus:
+            getUserSessionStatus(
+              visitor.id
+            )
         }
       });
     }
 
-    // ADMIN READS VISITOR SETTINGS
+    /*
+    | ADMIN READS VISITOR SETTINGS
+    */
 
     if (
       req.method === 'GET' &&
@@ -917,40 +1272,60 @@ async function handleRequest(req, res) {
       try {
         return send(res, 200, {
           success: true,
-          settings: await getFeatureSettings(visitorId)
+          settings:
+            await getFeatureSettings(
+              visitorId
+            )
         });
       } catch (error) {
-        console.error('Admin visitor settings error:', error.message);
+        console.error(
+          'Admin visitor settings error:',
+          error.message
+        );
 
         return send(res, 500, {
-          error: 'Could not load visitor settings.'
+          error:
+            'Could not load visitor settings.'
         });
       }
     }
 
-    // ADMIN UPDATES VISITOR SETTINGS
+    /*
+    | ADMIN UPDATES VISITOR SETTINGS
+    */
 
     if (
       req.method === 'POST' &&
       action === 'settings'
     ) {
       try {
-        const body = await readBody(req);
-        const settings = await updateSettings(visitorId, body);
+        const body =
+          await readBody(req);
+
+        const settings =
+          await updateSettings(
+            visitorId,
+            body
+          );
 
         return send(res, 200, {
           success: true,
-          message: 'Visitor settings updated.',
+          message:
+            'Visitor settings updated.',
           settings
         });
       } catch (error) {
         return send(res, 400, {
-          error: error.message || 'Could not update visitor settings.'
+          error:
+            error.message ||
+            'Could not update visitor settings.'
         });
       }
     }
 
-    // ADMIN LISTS BANNED NUMBERS
+    /*
+    | ADMIN LISTS BANNED NUMBERS
+    */
 
     if (
       req.method === 'GET' &&
@@ -959,18 +1334,27 @@ async function handleRequest(req, res) {
       try {
         return send(res, 200, {
           success: true,
-          bans: await listBotBans(visitorId)
+          bans:
+            await listBotBans(
+              visitorId
+            )
         });
       } catch (error) {
-        console.error('Visitor ban list error:', error.message);
+        console.error(
+          'Visitor ban list error:',
+          error.message
+        );
 
         return send(res, 500, {
-          error: 'Could not load visitor ban list.'
+          error:
+            'Could not load visitor ban list.'
         });
       }
     }
 
-    // ADMIN BANS A NUMBER
+    /*
+    | ADMIN BANS A NUMBER
+    */
 
     if (
       req.method === 'POST' &&
@@ -979,35 +1363,44 @@ async function handleRequest(req, res) {
       let body;
 
       try {
-        body = await readBody(req);
+        body =
+          await readBody(req);
 
         if (!body.phoneNumber) {
           return send(res, 400, {
-            error: 'Phone number is required.'
+            error:
+              'Phone number is required.'
           });
         }
 
-        const added = await banBotUser(
-          visitorId,
-          body.phoneNumber
-        );
+        const added =
+          await banBotUser(
+            visitorId,
+            body.phoneNumber
+          );
 
         return send(res, 200, {
           success: true,
           banned: true,
-          alreadyBanned: !added,
-          message: added
-            ? 'Number banned from this visitor bot.'
-            : 'Number was already banned.'
+          alreadyBanned:
+            !added,
+          message:
+            added
+              ? 'Number banned from this visitor bot.'
+              : 'Number was already banned.'
         });
       } catch (error) {
         return send(res, 400, {
-          error: error.message || 'Could not ban this number.'
+          error:
+            error.message ||
+            'Could not ban this number.'
         });
       }
     }
 
-    // ADMIN UNBANS A NUMBER
+    /*
+    | ADMIN UNBANS A NUMBER
+    */
 
     if (
       req.method === 'POST' &&
@@ -1016,35 +1409,42 @@ async function handleRequest(req, res) {
       let body;
 
       try {
-        body = await readBody(req);
+        body =
+          await readBody(req);
 
         if (!body.phoneNumber) {
           return send(res, 400, {
-            error: 'Phone number is required.'
+            error:
+              'Phone number is required.'
           });
         }
 
-        const removed = await unbanBotUser(
-          visitorId,
-          body.phoneNumber
-        );
+        const removed =
+          await unbanBotUser(
+            visitorId,
+            body.phoneNumber
+          );
 
         return send(res, 200, {
           success: true,
           unbanned: removed,
-          message: removed
-            ? 'Number unbanned from this visitor bot.'
-            : 'Number was not on this bot ban list.'
+          message:
+            removed
+              ? 'Number unbanned from this visitor bot.'
+              : 'Number was not on this bot ban list.'
         });
       } catch (error) {
         return send(res, 400, {
-          error: error.message || 'Could not unban this number.'
+          error:
+            error.message ||
+            'Could not unban this number.'
         });
       }
     }
 
     return send(res, 405, {
-      error: 'Method not allowed for this visitor route.'
+      error:
+        'Method not allowed for this visitor route.'
     });
   }
 
@@ -1053,33 +1453,245 @@ async function handleRequest(req, res) {
   });
 }
 
+/*
+|--------------------------------------------------------------------------
+| GRACEFUL SERVER SHUTDOWN
+|--------------------------------------------------------------------------
+*/
+
+async function handleShutdownSignal(signal) {
+  if (shuttingDown) {
+    console.log(
+      `Shutdown already in progress after ${signal}.`
+    );
+    return;
+  }
+
+  shuttingDown = true;
+
+  console.log('');
+  console.log(
+    `Received OS signal: ${signal}.`
+  );
+  console.log(
+    'Starting graceful SCANTY MD BOT shutdown...'
+  );
+
+  const forcedTimeout =
+    setTimeout(() => {
+      console.error(
+        'Graceful shutdown exceeded 10 seconds. Forcing process termination.'
+      );
+
+      process.exit(1);
+    }, 10000);
+
+  forcedTimeout.unref();
+
+  try {
+    /*
+    |--------------------------------------------------------------------------
+    | 1. STOP ACCEPTING NEW HTTP CONNECTIONS
+    |--------------------------------------------------------------------------
+    */
+
+    if (httpServer) {
+      console.log(
+        'Stopping new HTTP connections...'
+      );
+
+      await new Promise(resolve => {
+        httpServer.close(error => {
+          if (error) {
+            console.error(
+              'HTTP server close error:',
+              error.message
+            );
+          } else {
+            console.log(
+              'HTTP server stopped accepting new connections.'
+            );
+          }
+
+          resolve();
+        });
+      });
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | 2. CLOSE WHATSAPP SOCKETS + FLUSH SESSION WRITES
+    |--------------------------------------------------------------------------
+    */
+
+    console.log(
+      'Closing WhatsApp sessions and flushing session state...'
+    );
+
+    await closeSessionManagerGracefully();
+
+    /*
+    |--------------------------------------------------------------------------
+    | 3. DRAIN THIS SERVER'S POSTGRES POOL
+    |--------------------------------------------------------------------------
+    */
+
+    console.log(
+      'Draining application PostgreSQL pool...'
+    );
+
+    try {
+      await pool.end();
+
+      console.log(
+        'Application PostgreSQL pool disconnected safely.'
+      );
+    } catch (error) {
+      console.error(
+        'Error while draining application PostgreSQL pool:',
+        error.message
+      );
+    }
+
+    clearTimeout(
+      forcedTimeout
+    );
+
+    console.log(
+      '--- SCANTY MD BOT CLEANLY TERMINATED ---'
+    );
+
+    process.exit(0);
+  } catch (error) {
+    clearTimeout(
+      forcedTimeout
+    );
+
+    console.error(
+      'Fatal error during graceful shutdown:',
+      error
+    );
+
+    try {
+      await pool.end();
+    } catch {}
+
+    process.exit(1);
+  }
+}
+
+/*
+|--------------------------------------------------------------------------
+| SIGNAL HANDLERS
+|--------------------------------------------------------------------------
+*/
+
+process.once(
+  'SIGTERM',
+  () => {
+    handleShutdownSignal(
+      'SIGTERM'
+    ).catch(error => {
+      console.error(
+        'Unhandled SIGTERM shutdown error:',
+        error
+      );
+
+      process.exit(1);
+    });
+  }
+);
+
+process.once(
+  'SIGINT',
+  () => {
+    handleShutdownSignal(
+      'SIGINT'
+    ).catch(error => {
+      console.error(
+        'Unhandled SIGINT shutdown error:',
+        error
+      );
+
+      process.exit(1);
+    });
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| START SERVER
+|--------------------------------------------------------------------------
+*/
+
 async function startServer() {
   await initializeDatabase();
+
   await initializeSessionStorage();
+
   await initializeFeatureSettings();
+
   await restoreUserSessions();
 
-  const server = http.createServer((req, res) => {
-    handleRequest(req, res).catch(error => {
-      console.error('Request error:', error.message);
+  httpServer =
+    http.createServer(
+      (req, res) => {
+        handleRequest(
+          req,
+          res
+        ).catch(error => {
+          console.error(
+            'Request error:',
+            error.message
+          );
 
-      if (!res.headersSent) {
-        send(res, 500, {
-          error: 'Internal server error.'
+          if (!res.headersSent) {
+            send(res, 500, {
+              error:
+                'Internal server error.'
+            });
+          } else {
+            try {
+              res.end();
+            } catch {}
+          }
         });
-      } else {
-        res.end();
       }
-    });
-  });
+    );
 
-  server.listen(PORT, '0.0.0.0', () => {
-    console.log(`SCANTY MD BOT running on port ${PORT}`);
-    console.log('Allowed dashboard origin:', DASHBOARD_ORIGIN);
-  });
+  httpServer.listen(
+    PORT,
+    '0.0.0.0',
+    () => {
+      console.log(
+        `SCANTY MD BOT running on port ${PORT}`
+      );
+
+      console.log(
+        'Allowed dashboard origin:',
+        DASHBOARD_ORIGIN
+      );
+
+      console.log(
+        'QR request limit: 200 / 30 seconds'
+      );
+
+      console.log(
+        'QR polling limit: 200 / 30 seconds'
+      );
+
+      console.log(
+        'Phone pairing limit: 200 / 30 seconds'
+      );
+    }
+  );
 }
 
 startServer().catch(error => {
-  console.error('Server startup failed:', error.message);
+  console.error(
+    'Server startup failed:',
+    error.message
+  );
+
   process.exit(1);
 });
