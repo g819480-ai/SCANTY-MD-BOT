@@ -10,7 +10,11 @@ import {
 
 const DEFAULT_PREFIX = '.';
 const COMMAND_COOLDOWN_MS = 3000;
+const AI_COOLDOWN_MS = 4000;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+
 const lastCommands = new Map();
+const lastAIReplies = new Map();
 const MAX_RATE_LIMIT_ENTRIES = 5000;
 
 function normalizeJid(jid) {
@@ -21,15 +25,19 @@ function normalizeJid(jid) {
 
 function getMessageText(message) {
   let content = message?.message;
+
   for (let i = 0; content && i < 6; i += 1) {
-    const wrapped = content.ephemeralMessage?.message ||
+    const wrapped =
+      content.ephemeralMessage?.message ||
       content.viewOnceMessage?.message ||
       content.viewOnceMessageV2?.message ||
       content.viewOnceMessageV2Extension?.message ||
       content.documentWithCaptionMessage?.message;
+
     if (!wrapped) break;
     content = wrapped;
   }
+
   return String(
     content?.conversation ||
     content?.extendedTextMessage?.text ||
@@ -55,6 +63,18 @@ function isOwnerSelfChat(sock, message, chatId) {
     .includes(normalizeJid(chatId));
 }
 
+function cleanRateLimitMap(map) {
+  if (map.size <= MAX_RATE_LIMIT_ENTRIES) return;
+
+  for (const [entry, timestamp] of map) {
+    if (Date.now() - timestamp > 60000) {
+      map.delete(entry);
+    }
+
+    if (map.size <= MAX_RATE_LIMIT_ENTRIES) break;
+  }
+}
+
 function isRateLimited(key) {
   const now = Date.now();
   const previous = lastCommands.get(key);
@@ -64,15 +84,21 @@ function isRateLimited(key) {
   }
 
   lastCommands.set(key, now);
+  cleanRateLimitMap(lastCommands);
 
-  if (lastCommands.size > MAX_RATE_LIMIT_ENTRIES) {
-    for (const [entry, timestamp] of lastCommands) {
-      if (now - timestamp > COMMAND_COOLDOWN_MS) {
-        lastCommands.delete(entry);
-      }
-      if (lastCommands.size <= MAX_RATE_LIMIT_ENTRIES) break;
-    }
+  return false;
+}
+
+function isAIRateLimited(key) {
+  const now = Date.now();
+  const previous = lastAIReplies.get(key);
+
+  if (previous && now - previous < AI_COOLDOWN_MS) {
+    return true;
   }
+
+  lastAIReplies.set(key, now);
+  cleanRateLimitMap(lastAIReplies);
 
   return false;
 }
@@ -140,6 +166,7 @@ function menuText() {
     '┃ .groupinfo (groups)',
     '┃ .admins (groups)',
     '┃ .settings',
+    '┃ .ai on/off (owner only)',
     '┃ .alwaysonline on/off',
     '┃ .autoviewstatus on/off',
     '┃ .statusreact on/off',
@@ -148,11 +175,74 @@ function menuText() {
     '┃ .goodbye on/off',
     '┃ .autoreact on/off',
     '┃ .setemojis ❤️,🔥,😍',
-    '┃ .ban <phone number> (owner self-chat only)',
-    '┃ .bans / .unban <phone number> (owner self-chat only)',
+    '┃ .ban <phone number> (owner only)',
+    '┃ .bans / .unban <phone number> (owner only)',
     '┃ Note: unban removes a bot-access ban; it does not add anyone to a WhatsApp group.',
     '╰━━━━━━━━━━━━━━━━━━╯'
   ].join('\n');
+}
+
+async function generateGeminiReply(userText) {
+  const apiKey = process.env.GEMINI_API_KEY;
+
+  if (!apiKey) {
+    throw new Error('GEMINI_API_KEY is missing from the environment.');
+  }
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': apiKey
+      },
+      body: JSON.stringify({
+        systemInstruction: {
+          parts: [{
+            text:
+              'You are SCANTY MD BOT AI assistant. ' +
+              'Answer the user clearly, naturally, helpfully and politely. ' +
+              'Understand the question before answering. ' +
+              'Do not pretend to perform actions you cannot perform. ' +
+              'Keep answers reasonably concise and suitable for WhatsApp.'
+          }]
+        },
+        contents: [{
+          role: 'user',
+          parts: [{ text: userText.slice(0, 4000) }]
+        }],
+        generationConfig: {
+          temperature: 0.7,
+          maxOutputTokens: 700
+        }
+      }),
+      signal: AbortSignal.timeout(25000)
+    }
+  );
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    console.error(
+      'Gemini API error:',
+      response.status,
+      data?.error?.message || 'Unknown API error'
+    );
+
+    throw new Error(`Gemini API request failed (${response.status}).`);
+  }
+
+  const answer = data?.candidates?.[0]?.content?.parts
+    ?.map(part => part.text || '')
+    .join('')
+    .trim();
+
+  if (!answer) {
+    throw new Error('Gemini returned an empty response.');
+  }
+
+  return answer.slice(0, 4000);
 }
 
 export async function handleIncomingMessage(sock, userId, message) {
@@ -179,7 +269,6 @@ export async function handleIncomingMessage(sock, userId, message) {
 
   const senderPhone = phoneFromJid(senderJid);
 
-  // Protect database checks and settings retrieval.
   let settings;
 
   try {
@@ -209,8 +298,38 @@ export async function handleIncomingMessage(sock, userId, message) {
   }
 
   const prefix = settings.prefix || DEFAULT_PREFIX;
+  const reply = response =>
+    sock.sendMessage(
+      chatId,
+      { text: response },
+      { quoted: message }
+    );
 
-  if (!text.startsWith(prefix)) return;
+  // Commands are processed before ordinary AI messages.
+  if (!text.startsWith(prefix)) {
+    if (!settings.aiChatEnabled) return;
+
+    const aiKey = `${userId}:${chatId}`;
+
+    if (isAI rateLimited(aiKey)) return;
+
+    try {
+      const answer = await generateGeminiReply(text);
+      await reply(answer);
+    } catch (error) {
+      console.error('Gemini reply error:', error);
+
+      try {
+        await reply(
+          '⚠️ SCANTY MD BOT AI is temporarily unavailable. Please try again shortly.'
+        );
+      } catch (sendError) {
+        console.error('Could not send Gemini error reply:', sendError);
+      }
+    }
+
+    return;
+  }
 
   const parts = text
     .slice(prefix.length)
@@ -222,13 +341,6 @@ export async function handleIncomingMessage(sock, userId, message) {
   const args = parts;
 
   if (!command || isRateLimited(`${userId}:${senderJid}`)) return;
-
-  const reply = response =>
-    sock.sendMessage(
-      chatId,
-      { text: response },
-      { quoted: message }
-    );
 
   const ownerOnly = async () => {
     if (selfChat) return true;
@@ -245,6 +357,30 @@ export async function handleIncomingMessage(sock, userId, message) {
       case 'menu':
       case 'help':
         return reply(menuText());
+
+      case 'ai': {
+        if (!(await ownerOnly())) return;
+
+        const value = args[0]?.toLowerCase();
+
+        if (!['on', 'off'].includes(value)) {
+          return reply(
+            'Usage: .ai on\nOr: .ai off'
+          );
+        }
+
+        await setFeatureSetting(
+          userId,
+          'aiChatEnabled',
+          value === 'on'
+        );
+
+        return reply(
+          value === 'on'
+            ? '🤖 Gemini AI is now ON. Ordinary messages will receive AI replies. Bot commands will continue working.'
+            : '✅ Gemini AI is now OFF. Ordinary messages will no longer receive AI replies.'
+        );
+      }
 
       case 'ping':
         return reply('🏓 SCANTY MD BOT is responding.');
@@ -321,6 +457,7 @@ export async function handleIncomingMessage(sock, userId, message) {
           `Welcome: ${settings.welcome ? 'ON' : 'OFF'}`,
           `Goodbye: ${settings.goodbye ? 'ON' : 'OFF'}`,
           `Auto React: ${settings.autoReact ? 'ON' : 'OFF'}`,
+          `Gemini AI: ${settings.aiChatEnabled ? 'ON' : 'OFF'}`,
           `Status emojis: ${(settings.statusEmojis || []).join(' ')}`,
           `Prefix: ${prefix}`
         ].join('\n'));
