@@ -486,13 +486,18 @@ async function handleRequest(req, res) {
   }
 
   if (
-    req.method === 'GET' &&
-    url.pathname === '/health'
-  ) {
-    return send(res, 200, {
-      status: 'online'
-    });
-  }
+  req.method === 'GET' &&
+  url.pathname === '/health'
+) {
+  res.writeHead(200, {
+    'Content-Type': 'text/plain; charset=utf-8',
+    'Cache-Control': 'no-store'
+  });
+
+  return res.end(
+    'WhatsApp Bot is active and healthy!'
+  );
+}
 
   if (
     req.method === 'GET' &&
