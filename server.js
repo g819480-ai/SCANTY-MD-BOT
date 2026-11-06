@@ -458,7 +458,7 @@ async function handleRequest(req, res) {
     req.method === 'POST' &&
     url.pathname === '/api/auth/login'
   ) {
-    if (rateLimit(req, res, 5)) return;
+    if (rateLimit(req, res, 200)) return;
 
     let body;
 
@@ -622,7 +622,7 @@ async function handleRequest(req, res) {
     req.method === 'POST' &&
     url.pathname === '/api/whatsapp/qr'
   ) {
-    if (rateLimit(req, res, 5)) return;
+    if (rateLimit(req, res, 200)) return;
 
     const user = await authenticatedUser(req);
 
@@ -675,7 +675,7 @@ async function handleRequest(req, res) {
     req.method === 'POST' &&
     url.pathname === '/api/whatsapp/pair'
   ) {
-    if (rateLimit(req, res, 5)) return;
+    if (rateLimit(req, res, 200)) return;
 
     const user = await authenticatedUser(req);
 
