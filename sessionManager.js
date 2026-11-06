@@ -1,4 +1,3 @@
-
 import makeWASocket, {
   initAuthCreds,
   BufferJSON,
@@ -16,11 +15,11 @@ import pg from 'pg';
 import { handleIncomingMessage } from './messageHandler.js';
 import { handleStatusUpdate } from './statusEvents.js';
 import { getFeatureSettings } from './featureSettings.js';
+
 import {
   cleanupExhaustedReconnect,
   createReconnectController,
   reconnectIfCurrent,
-  waitForSocketReady,
   withPairingLock
 } from './whatsappLifecycle.js';
 
@@ -59,8 +58,14 @@ const encryptionKey = crypto
 
 function normalizeQrValue(qr) {
   if (!qr) return null;
-  if (typeof qr === 'string') return qr;
-  if (Buffer.isBuffer(qr)) return qr.toString('base64');
+
+  if (typeof qr === 'string') {
+    return qr;
+  }
+
+  if (Buffer.isBuffer(qr)) {
+    return qr.toString('base64');
+  }
 
   if (typeof qr === 'object') {
     if (typeof qr.data !== 'undefined') {
@@ -155,7 +160,9 @@ async function readRecord(userId, type, id) {
     [userId, type, id]
   );
 
-  if (!result.rows[0]) return null;
+  if (!result.rows[0]) {
+    return null;
+  }
 
   return JSON.parse(
     decrypt(result.rows[0].encrypted_data),
@@ -180,7 +187,9 @@ function makeAuthState(userId, creds) {
                 proto.Message.AppStateSyncKeyData.create(value);
             }
 
-            if (value) values[id] = value;
+            if (value) {
+              values[id] = value;
+            }
           })
         );
 
@@ -210,7 +219,9 @@ function stopPresenceHeartbeat(userId) {
 }
 
 async function updatePresence(userId, sock) {
-  if (sessions.get(userId) !== sock) return;
+  if (sessions.get(userId) !== sock) {
+    return;
+  }
 
   try {
     const settings = await getFeatureSettings(userId);
@@ -251,7 +262,9 @@ async function sendScantyWelcome(userId, sock) {
       'welcome_notice_sent'
     );
 
-    if (alreadyWelcomed) return;
+    if (alreadyWelcomed) {
+      return;
+    }
 
     const linkedJid = sock.user?.id;
 
@@ -301,11 +314,12 @@ async function sendScantyWelcome(userId, sock) {
     );
   }
 }
-
 function getReconnectController(userId, state, captureQr) {
   const existing = reconnectControllers.get(userId);
 
-  if (existing) return existing;
+  if (existing) {
+    return existing;
+  }
 
   let controller;
 
@@ -409,7 +423,8 @@ async function attachSocket(
   state,
   captureQr = false,
   suppliedController = null,
-  expectedSocket = null
+  expectedSocket = null,
+  pairingCallbacks = null
 ) {
   if (
     expectedSocket &&
@@ -481,6 +496,8 @@ async function attachSocket(
     expectedSocket: sock
   });
 
+  let pairingReady = false;
+
   sock.ev.on('creds.update', async () => {
     console.log('WHATSAPP CREDS UPDATE:', {
       registered: state.creds.registered === true,
@@ -507,14 +524,15 @@ async function attachSocket(
     }
   });
 
-  // Handle incoming notifications and outgoing self-chat messages.
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     console.log('WHATSAPP MESSAGE EVENT:', {
       type,
       count: messages?.length || 0
     });
 
-    if (type !== 'notify' && type !== 'append') return;
+    if (type !== 'notify' && type !== 'append') {
+      return;
+    }
 
     for (const message of messages || []) {
       try {
@@ -541,17 +559,30 @@ async function attachSocket(
     lastDisconnect,
     qr
   }) => {
-    if (sessions.get(userId) !== sock) return;
+    if (sessions.get(userId) !== sock) {
+      return;
+    }
 
     const statusCode =
       lastDisconnect?.error?.output?.statusCode;
 
-    if (captureQr && qr) {
-      qrStates.set(userId, {
-        qr: normalizeQrValue(qr),
-        status: 'qr',
-        updatedAt: Date.now()
-      });
+    // QR event is also the readiness signal for pairing-code login.
+    if (qr) {
+      if (captureQr) {
+        qrStates.set(userId, {
+          qr: normalizeQrValue(qr),
+          status: 'qr',
+          updatedAt: Date.now()
+        });
+      }
+
+      if (
+        pairingCallbacks &&
+        !pairingReady
+      ) {
+        pairingReady = true;
+        pairingCallbacks.onReady?.();
+      }
     }
 
     if (connection === 'open') {
@@ -594,16 +625,30 @@ async function attachSocket(
       return;
     }
 
-    if (connection !== 'close') return;
+    if (connection !== 'close') {
+      return;
+    }
 
     stopPresenceHeartbeat(userId);
+
+    const closeError =
+      lastDisconnect?.error ||
+      new Error('WhatsApp connection closed.');
 
     console.error('WHATSAPP DISCONNECT DETAILS:', {
       userId,
       statusCode,
-      message: lastDisconnect?.error?.message,
-      error: lastDisconnect?.error?.toString()
+      message: closeError.message,
+      error: closeError.toString()
     });
+
+    // Reject pairing readiness only if the QR event has not arrived.
+    if (
+      pairingCallbacks &&
+      !pairingReady
+    ) {
+      pairingCallbacks.onClosed?.(closeError);
+    }
 
     if (!controller.schedule(statusCode, sock)) {
       cleanupExhaustedReconnect({
@@ -622,7 +667,6 @@ async function attachSocket(
 
   return sock;
 }
-
 export async function initializeSessionStorage() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS whatsapp_sessions (
@@ -653,7 +697,9 @@ export async function restoreUserSessions() {
   );
 
   for (const { user_id: userId } of result.rows) {
-    if (sessions.has(userId)) continue;
+    if (sessions.has(userId)) {
+      continue;
+    }
 
     try {
       const creds = await readRecord(
@@ -796,28 +842,86 @@ export async function startUserSession(
       qrStates.delete(userId);
 
       const state = makeAuthState(userId, savedCreds);
-      const sock = await attachSocket(userId, state);
+
+      let resolveReady;
+      let rejectReady;
+      let readinessTimer;
+
+      const readiness = new Promise((resolve, reject) => {
+        resolveReady = resolve;
+        rejectReady = reject;
+      });
+
+      const pairingCallbacks = {
+        onReady: () => {
+          resolveReady();
+        },
+
+        onClosed: error => {
+          rejectReady(
+            error instanceof Error
+              ? error
+              : new Error('WhatsApp closed before pairing was ready.')
+          );
+        }
+      };
+
+      let sock = null;
 
       try {
+        sock = await attachSocket(
+          userId,
+          state,
+          false,
+          null,
+          null,
+          pairingCallbacks
+        );
+
         if (!sock) {
           throw new Error(
-            'WhatsApp socket was superseded before pairing.'
+            'WhatsApp socket could not be started.'
           );
         }
 
-        await waitForSocketReady(sock);
+        readinessTimer = setTimeout(() => {
+          rejectReady(
+            new Error(
+              'WhatsApp did not send its pairing-ready QR event in time. Please try again.'
+            )
+          );
+        }, 30000);
+
+        await readiness;
+
+        clearTimeout(readinessTimer);
+        readinessTimer = null;
 
         if (
           sessions.get(userId) !== sock ||
           sessionStatus.get(userId) === 'disconnected'
         ) {
           throw new Error(
-            'WhatsApp socket closed before pairing.'
+            'WhatsApp connection closed before the pairing code could be requested.'
           );
         }
 
+        console.log(
+          'WhatsApp pairing-ready event received. Requesting pairing code.'
+        );
+
         const code = await sock.requestPairingCode(
           phoneNumber
+        );
+
+        if (!code) {
+          throw new Error(
+            'WhatsApp did not return a pairing code.'
+          );
+        }
+
+        console.log(
+          'WhatsApp pairing code successfully generated.'
         );
 
         if (typeof onPairingCode === 'function') {
@@ -825,7 +929,13 @@ export async function startUserSession(
         }
 
         return { started: true };
+
       } catch (error) {
+        if (readinessTimer) {
+          clearTimeout(readinessTimer);
+          readinessTimer = null;
+        }
+
         stopPresenceHeartbeat(userId);
 
         const activeController =
@@ -842,11 +952,13 @@ export async function startUserSession(
         const activeContext =
           reconnectContexts.get(userId);
 
-        if (activeContext?.controller === activeController) {
+        if (
+          activeContext?.controller === activeController
+        ) {
           reconnectContexts.delete(userId);
         }
 
-        if (sessions.get(userId) === sock) {
+        if (sock && sessions.get(userId) === sock) {
           sessions.delete(userId);
         }
 
