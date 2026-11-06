@@ -78,7 +78,8 @@ function normalizeQrValue(qr) {
       qr.toString() !== '[object Object]'
     ) {
       return qr.toString();
-      }
+    }
+  }
 
   return String(qr);
 }
