@@ -1,3 +1,4 @@
+
 import makeWASocket, {
   initAuthCreds,
   BufferJSON,
@@ -35,6 +36,11 @@ const reconnectControllers = new Map();
 const pairingLocks = new Set();
 const reconnectContexts = new Map();
 
+// Serializes writes to the same WhatsApp session record.
+const recordWriteQueues = new Map();
+
+let encryptedDataType = null;
+
 const secret = process.env.SESSION_ENCRYPTION_KEY?.trim();
 
 if (!secret || secret.length < 64) {
@@ -47,10 +53,15 @@ if (!process.env.DATABASE_URL) {
   throw new Error('DATABASE_URL is missing.');
 }
 
+// Use the same PostgreSQL connection compatibility settings as server.js.
+const databaseUrl = new URL(process.env.DATABASE_URL);
+databaseUrl.searchParams.set('uselibpqcompat', 'true');
+databaseUrl.searchParams.set('sslmode', 'require');
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  max: 5
+  connectionString: databaseUrl.toString(),
+  max: 5,
+  connectionTimeoutMillis: 10000
 });
 
 const encryptionKey = crypto
@@ -83,7 +94,7 @@ function normalizeQrValue(qr) {
   return String(qr);
 }
 
-const QR_VALIDITY_MS = 30_000;
+const QR_VALIDITY_MS = 30000;
 
 function clearQrExpiryTimer(userId) {
   const timer = qrExpiryTimers.get(userId);
@@ -162,7 +173,12 @@ function encrypt(value) {
 }
 
 function decrypt(value) {
-  const [ivText, tagText, dataText] = value.split('.');
+  // PostgreSQL BYTEA values are returned as Buffers by node-postgres.
+  const encryptedText = Buffer.isBuffer(value)
+    ? value.toString('utf8')
+    : String(value);
+
+  const [ivText, tagText, dataText] = encryptedText.split('.');
 
   if (!ivText || !tagText || !dataText) {
     throw new Error('Invalid encrypted WhatsApp session record.');
@@ -182,7 +198,13 @@ function decrypt(value) {
   ]).toString('utf8');
 }
 
-async function saveRecord(userId, type, id, value) {
+async function persistRecord(userId, type, id, value) {
+  if (!encryptedDataType) {
+    throw new Error(
+      'WhatsApp session storage has not been initialized.'
+    );
+  }
+
   if (value == null) {
     await pool.query(
       `DELETE FROM whatsapp_sessions
@@ -197,6 +219,11 @@ async function saveRecord(userId, type, id, value) {
     JSON.stringify(value, BufferJSON.replacer)
   );
 
+  // TEXT columns receive strings; BYTEA columns receive UTF-8 Buffers.
+  const databaseValue = encryptedDataType === 'bytea'
+    ? Buffer.from(encrypted, 'utf8')
+    : encrypted;
+
   await pool.query(
     `INSERT INTO whatsapp_sessions
       (user_id, record_type, record_id, encrypted_data)
@@ -205,8 +232,39 @@ async function saveRecord(userId, type, id, value) {
      DO UPDATE SET
        encrypted_data=EXCLUDED.encrypted_data,
        updated_at=NOW()`,
-    [userId, type, id, encrypted]
+    [userId, type, id, databaseValue]
   );
+}
+
+async function saveRecord(userId, type, id, value) {
+  const queueKey = `${userId}:${type}:${id}`;
+
+  const previousWrite =
+    recordWriteQueues.get(queueKey) || Promise.resolve();
+
+  const currentWrite = previousWrite
+    .catch(() => {})
+    .then(() => persistRecord(userId, type, id, value));
+
+  recordWriteQueues.set(queueKey, currentWrite);
+
+  const cleanup = () => {
+    if (recordWriteQueues.get(queueKey) === currentWrite) {
+      recordWriteQueues.delete(queueKey);
+    }
+  };
+
+  currentWrite.then(cleanup, cleanup);
+
+  return currentWrite;
+}
+
+// Allows pending session writes to finish before a controlled shutdown.
+export async function flushSessionWrites() {
+  while (recordWriteQueues.size > 0) {
+    const pending = Array.from(recordWriteQueues.values());
+    await Promise.allSettled(pending);
+  }
 }
 
 async function readRecord(userId, type, id) {
@@ -764,16 +822,47 @@ async function attachSocket(
 }
 
 export async function initializeSessionStorage() {
+  // BYTEA is used for new installations.
+  // Existing TEXT tables are deliberately not altered here.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS whatsapp_sessions (
       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       record_type TEXT NOT NULL,
       record_id TEXT NOT NULL,
-      encrypted_data TEXT NOT NULL,
+      encrypted_data BYTEA NOT NULL,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       PRIMARY KEY (user_id, record_type, record_id)
     )
   `);
+
+  const schemaResult = await pool.query(
+    `SELECT data_type
+     FROM information_schema.columns
+     WHERE table_schema = current_schema()
+       AND table_name = 'whatsapp_sessions'
+       AND column_name = 'encrypted_data'`
+  );
+
+  if (!schemaResult.rows.length) {
+    throw new Error(
+      'Could not find whatsapp_sessions.encrypted_data.'
+    );
+  }
+
+  encryptedDataType = schemaResult.rows[0].data_type;
+
+  if (
+    encryptedDataType !== 'text' &&
+    encryptedDataType !== 'bytea'
+  ) {
+    throw new Error(
+      `Unsupported encrypted_data column type: ${encryptedDataType}`
+    );
+  }
+
+  console.log('WHATSAPP SESSION STORAGE READY:', {
+    encryptedDataType
+  });
 }
 
 export async function restoreUserSessions() {
