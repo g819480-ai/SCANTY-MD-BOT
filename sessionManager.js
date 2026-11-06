@@ -78,10 +78,11 @@ function normalizeQrValue(qr) {
       qr.toString() !== '[object Object]'
     ) {
       return qr.toString();
-    }
-      return String(qr);
+      }
+
+  return String(qr);
 }
-  }
+
 const QR_VALIDITY_MS = 30_000;
 
 function clearQrExpiryTimer(userId) {
