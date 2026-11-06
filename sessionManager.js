@@ -31,6 +31,7 @@ const sessions = new Map();
 const sessionStatus = new Map();
 const presenceTimers = new Map();
 const qrStates = new Map();
+const qrExpiryTimers = new Map();
 const reconnectControllers = new Map();
 const pairingLocks = new Set();
 const reconnectContexts = new Map();
@@ -79,7 +80,59 @@ function normalizeQrValue(qr) {
       return qr.toString();
     }
   }
+const QR_VALIDITY_MS = 30_000;
 
+function clearQrExpiryTimer(userId) {
+  const timer = qrExpiryTimers.get(userId);
+  if (timer) clearTimeout(timer);
+  qrExpiryTimers.delete(userId);
+}
+
+function expireQrSession(userId, expectedSocket, expectedExpiresAt) {
+  const currentQr = qrStates.get(userId);
+  const controller = reconnectControllers.get(userId);
+  const context = reconnectContexts.get(userId);
+
+  if (
+    !currentQr ||
+    currentQr.status !== 'qr' ||
+    currentQr.expiresAt !== expectedExpiresAt ||
+    sessions.get(userId) !== expectedSocket
+  ) {
+    return false;
+  }
+
+  clearQrExpiryTimer(userId);
+  controller?.stop();
+  stopPresenceHeartbeat(userId);
+
+  sessions.delete(userId);
+  sessionStatus.set(userId, 'expired');
+
+  if (
+    controller &&
+    context?.controller === controller &&
+    context.expectedSocket === expectedSocket
+  ) {
+    reconnectControllers.delete(userId);
+    reconnectContexts.delete(userId);
+  }
+
+  qrStates.set(userId, {
+    qr: null,
+    status: 'expired',
+    updatedAt: Date.now(),
+    expiresAt: expectedExpiresAt,
+    remainingSeconds: 0
+  });
+
+  try {
+    expectedSocket.end(new Error('QR code expired after 30 seconds.'));
+  } catch {}
+
+  console.log('WHATSAPP QR EXPIRED:', { userId });
+  return true;
+}
   return String(qr);
 }
 
@@ -561,24 +614,39 @@ async function attachSocket(
       lastDisconnect?.error?.output?.statusCode;
 
     if (captureQr && qr) {
-      qrStates.set(userId, {
-        qr: normalizeQrValue(qr),
-        status: 'qr',
-        updatedAt: Date.now()
-      });
-    }
+  clearQrExpiryTimer(userId);
+
+  const expiresAt = Date.now() + QR_VALIDITY_MS;
+
+  qrStates.set(userId, {
+    qr: normalizeQrValue(qr),
+    status: 'qr',
+    updatedAt: Date.now(),
+    expiresAt
+  });
+
+  const expiryTimer = setTimeout(() => {
+    expireQrSession(userId, sock, expiresAt);
+  }, QR_VALIDITY_MS);
+
+  qrExpiryTimers.set(userId, expiryTimer);
+}
 
     if (connection === 'open') {
       controller.connected();
       sessionStatus.set(userId, 'connected');
 
       if (captureQr) {
-        qrStates.set(userId, {
-          qr: null,
-          status: 'connected',
-          updatedAt: Date.now()
-        });
-      }
+  clearQrExpiryTimer(userId);
+
+  qrStates.set(userId, {
+    qr: null,
+    status: 'connected',
+    updatedAt: Date.now(),
+    expiresAt: null,
+    remainingSeconds: null
+  });
+}
 
       console.log(`WhatsApp connected for user ${userId}`);
 
@@ -706,20 +774,56 @@ export function getUserSessionStatus(userId) {
   return sessionStatus.get(userId) || 'not_connected';
 }
 
+function serializeQrState(state, includeQr = true) {
+  if (!state) return null;
+
+  const remainingSeconds = state.expiresAt
+    ? Math.max(0, Math.ceil((state.expiresAt - Date.now()) / 1000))
+    : null;
+
+  return {
+    ...(includeQr
+      ? {
+          qr:
+            state.status === 'qr' && remainingSeconds > 0
+              ? state.qr
+              : null
+        }
+      : {}),
+    status:
+      state.expiresAt &&
+      remainingSeconds === 0 &&
+      state.status === 'qr'
+        ? 'expired'
+        : state.status,
+    updatedAt: state.updatedAt,
+    expiresAt: state.expiresAt || null,
+    remainingSeconds
+  };
+}
+
 export function getUserQrState(userId) {
   const state = qrStates.get(userId);
 
   if (!state) {
     return {
       qr: null,
-      status: getUserSessionStatus(userId)
+      status: getUserSessionStatus(userId),
+      expiresAt: null,
+      remainingSeconds: null
     };
   }
 
-  return {
-    qr: state.qr,
-    status: state.status
-  };
+  return serializeQrState(state, true);
+}
+
+export function getQrMonitoringStates() {
+  return Array.from(qrStates.entries())
+    .map(([userId, state]) => ({
+      userId,
+      ...serializeQrState(state, false)
+    }))
+    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
 }
 
 export async function startUserQrSession(userId) {
@@ -750,7 +854,7 @@ export async function startUserQrSession(userId) {
       }
 
       const state = makeAuthState(userId, savedCreds);
-
+      clearQrExpiryTimer(userId);
       qrStates.set(userId, {
         qr: null,
         status: 'connecting',
@@ -782,7 +886,7 @@ export async function startUserSession(
           'Enter your country code and phone number using digits only.'
         );
       }
-
+     clearQrExpiryTimer(userId);
       if (sessions.has(userId)) {
         throw new Error(
           'A WhatsApp session is already active for this user.'
