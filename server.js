@@ -1700,3 +1700,19 @@ startServer().catch(error => {
 
   process.exit(1);
 });
+import https from 'node:https';
+
+// Self-ping interval loop to prevent sleeping
+setInterval(() => {
+  const healthUrl = 'https://onrender.com';
+  
+  https.get(healthUrl, (res) => {
+    if (res.statusCode === 200) {
+      console.log('Self-ping successful: Bot service remains active.');
+    } else {
+      console.warn(`Self-ping warning: Status code received was ${res.statusCode}`);
+    }
+  }).on('error', (err) => {
+    console.error('Self-ping network failure:', err.message);
+  });
+}, 300000); // 300,000 milliseconds = 5 minutes
