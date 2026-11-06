@@ -1,9 +1,11 @@
+
 import 'dotenv/config';
 import http from 'node:http';
-import pg from 'pg';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import crypto from 'node:crypto';
+
+import { getMongoDb } from './mongo.js';
 
 import {
   initializeSessionStorage,
@@ -23,10 +25,7 @@ import {
   unbanBotUser
 } from './featureSettings.js';
 
-const { Pool } = pg;
-
 const PORT = process.env.PORT || 3000;
-const DATABASE_URL = process.env.DATABASE_URL;
 const JWT_SECRET = process.env.JWT_SECRET;
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL?.trim().toLowerCase();
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
@@ -36,9 +35,9 @@ const DASHBOARD_ORIGIN = (
   'https://scanty-md-dashboard.g819480.workers.dev'
 ).trim().replace(/\/+$/, '');
 
-if (!DATABASE_URL || !JWT_SECRET || JWT_SECRET.length < 32) {
+if (!JWT_SECRET || JWT_SECRET.length < 32) {
   throw new Error(
-    'DATABASE_URL and a JWT_SECRET of at least 32 characters are required.'
+    'JWT_SECRET of at least 32 characters is required.'
   );
 }
 
@@ -52,13 +51,6 @@ if (
     'Set ADMIN_EMAIL and an ADMIN_PASSWORD of at least 12 characters.'
   );
 }
-
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  max: 5,
-  connectionTimeoutMillis: 10000
-});
 
 const ALLOWED_SETTINGS = [
   'alwaysOnline',
@@ -91,6 +83,7 @@ function send(res, status, data) {
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff'
   });
+
   res.end(JSON.stringify(data));
 }
 
@@ -129,7 +122,10 @@ function createToken(user, isGuest = false) {
 
 function getToken(req) {
   const header = req.headers.authorization || '';
-  return header.startsWith('Bearer ') ? header.slice(7) : null;
+
+  return header.startsWith('Bearer ')
+    ? header.slice(7)
+    : null;
 }
 
 async function authenticatedUser(req) {
@@ -140,13 +136,11 @@ async function authenticatedUser(req) {
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
 
-    const result = await pool.query(
-      `SELECT id, email, role, is_guest, created_at
-       FROM users WHERE id = $1`,
-      [decoded.userId]
-    );
+    const db = await getMongoDb();
 
-    const user = result.rows[0];
+    const user = await db.collection('users').findOne({
+      id: String(decoded.userId)
+    });
 
     if (!user) return null;
     if (decoded.guest && !user.is_guest) return null;
@@ -178,7 +172,11 @@ function rateLimit(req, res, limit = 20) {
   const previous = rateLimits.get(key);
 
   if (!previous || now - previous.start > 60000) {
-    rateLimits.set(key, { start: now, count: 1 });
+    rateLimits.set(key, {
+      start: now,
+      count: 1
+    });
+
     return false;
   }
 
@@ -188,50 +186,70 @@ function rateLimit(req, res, limit = 20) {
     send(res, 429, {
       error: 'Too many requests. Please try again later.'
     });
+
     return true;
   }
 
   return false;
 }
 
+/*
+ * MONGODB INITIALIZATION
+ */
+
 async function initializeDatabase() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      email TEXT NOT NULL UNIQUE,
-      password_hash TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
+  const db = await getMongoDb();
 
-  await pool.query(`
-    ALTER TABLE users
-    ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user'
-  `);
-
-  await pool.query(`
-    ALTER TABLE users
-    ADD COLUMN IF NOT EXISTS is_guest BOOLEAN NOT NULL DEFAULT FALSE
-  `);
-
-  await pool.query(`
-    UPDATE users SET role = 'user'
-    WHERE role IS NULL OR role NOT IN ('user', 'admin')
-  `);
-
-  const passwordHash = await bcrypt.hash(ADMIN_PASSWORD, 12);
-
-  await pool.query(
-    `INSERT INTO users (email, password_hash, role, is_guest)
-     VALUES ($1, $2, 'admin', FALSE)
-     ON CONFLICT (email) DO UPDATE SET
-       password_hash = EXCLUDED.password_hash,
-       role = 'admin',
-       is_guest = FALSE`,
-    [ADMIN_EMAIL, passwordHash]
+  await db.collection('users').createIndex(
+    { email: 1 },
+    { unique: true }
   );
 
-  console.log('Database initialized.');
+  await db.collection('users').createIndex({
+    is_guest: 1,
+    created_at: -1
+  });
+
+  await db.collection('whatsapp_sessions').createIndex({
+    user_id: 1,
+    record_type: 1,
+    record_id: 1
+  });
+
+  await db.collection('bot_settings').createIndex(
+    { user_id: 1 },
+    { unique: true }
+  );
+
+  await db.collection('bot_bans').createIndex(
+    { user_id: 1, phone_number: 1 },
+    { unique: true }
+  );
+
+  const passwordHash = await bcrypt.hash(
+    ADMIN_PASSWORD,
+    12
+  );
+
+  await db.collection('users').updateOne(
+    { email: ADMIN_EMAIL },
+    {
+      $set: {
+        email: ADMIN_EMAIL,
+        password_hash: passwordHash,
+        role: 'admin',
+        is_guest: false
+      },
+      $setOnInsert: {
+        _id: crypto.randomUUID(),
+        id: crypto.randomUUID(),
+        created_at: new Date()
+      }
+    },
+    { upsert: true }
+  );
+
+  console.log('MongoDB database initialized.');
 }
 
 async function requireAdmin(req, res) {
@@ -241,6 +259,7 @@ async function requireAdmin(req, res) {
     send(res, 403, {
       error: 'Administrator access required.'
     });
+
     return null;
   }
 
@@ -254,6 +273,7 @@ async function requireVisitor(req, res) {
     send(res, 401, {
       error: 'A valid visitor pairing session is required.'
     });
+
     return null;
   }
 
@@ -265,14 +285,12 @@ async function findVisitor(visitorId) {
     return null;
   }
 
-  const result = await pool.query(
-    `SELECT id, created_at
-     FROM users
-     WHERE id = $1 AND is_guest = TRUE`,
-    [visitorId]
-  );
+  const db = await getMongoDb();
 
-  return result.rows[0] || null;
+  return db.collection('users').findOne({
+    id: String(visitorId),
+    is_guest: true
+  });
 }
 
 async function updateSettings(userId, body) {
@@ -331,6 +349,7 @@ async function handleRequest(req, res) {
       'Access-Control-Allow-Origin',
       DASHBOARD_ORIGIN
     );
+
     res.setHeader('Vary', 'Origin');
   }
 
@@ -386,11 +405,12 @@ async function handleRequest(req, res) {
 
   if (req.method === 'GET' && url.pathname === '/db-health') {
     try {
-      await pool.query('SELECT NOW()');
+      const db = await getMongoDb();
+      await db.command({ ping: 1 });
 
       return send(res, 200, {
         status: 'connected',
-        database: 'Neon PostgreSQL'
+        database: 'MongoDB Atlas'
       });
     } catch (error) {
       console.error('Database health error:', error.message);
@@ -410,22 +430,36 @@ async function handleRequest(req, res) {
     if (rateLimit(req, res, 5)) return;
 
     try {
-      const guestId = crypto.randomUUID();
-      const guestEmail = `guest-${guestId}@guest.scanty.invalid`;
-      const randomPassword = crypto.randomBytes(48).toString('hex');
-      const passwordHash = await bcrypt.hash(randomPassword, 10);
+      const db = await getMongoDb();
 
-      const result = await pool.query(
-        `INSERT INTO users
-          (id, email, password_hash, role, is_guest)
-         VALUES ($1, $2, $3, 'user', TRUE)
-         RETURNING id`,
-        [guestId, guestEmail, passwordHash]
+      const guestId = crypto.randomUUID();
+
+      const guestEmail =
+        `guest-${guestId}@guest.scanty.invalid`;
+
+      const randomPassword =
+        crypto.randomBytes(48).toString('hex');
+
+      const passwordHash = await bcrypt.hash(
+        randomPassword,
+        10
       );
+
+      const guest = {
+        _id: guestId,
+        id: guestId,
+        email: guestEmail,
+        password_hash: passwordHash,
+        role: 'user',
+        is_guest: true,
+        created_at: new Date()
+      };
+
+      await db.collection('users').insertOne(guest);
 
       return send(res, 201, {
         success: true,
-        token: createToken(result.rows[0], true),
+        token: createToken(guest, true),
         message: 'Private pairing session created.'
       });
     } catch (error) {
@@ -469,7 +503,10 @@ async function handleRequest(req, res) {
       });
     }
 
-    const email = String(body.email || '').trim().toLowerCase();
+    const email = String(body.email || '')
+      .trim()
+      .toLowerCase();
+
     const password = body.password;
 
     if (
@@ -484,14 +521,12 @@ async function handleRequest(req, res) {
     }
 
     try {
-      const result = await pool.query(
-        `SELECT id, email, password_hash, role
-         FROM users
-         WHERE email = $1 AND is_guest = FALSE`,
-        [ADMIN_EMAIL]
-      );
+      const db = await getMongoDb();
 
-      const user = result.rows[0];
+      const user = await db.collection('users').findOne({
+        email: ADMIN_EMAIL,
+        is_guest: false
+      });
 
       if (
         !user ||
@@ -596,11 +631,8 @@ async function handleRequest(req, res) {
 
     if (!user) return;
 
-    let body;
-
     try {
-      body = await readBody(req);
-
+      const body = await readBody(req);
       const settings = await updateSettings(user.id, body);
 
       return send(res, 200, {
@@ -748,62 +780,70 @@ async function handleRequest(req, res) {
     if (!admin) return;
 
     try {
+      const db = await getMongoDb();
+      const users = db.collection('users');
+
       if (url.pathname === '/api/admin/stats') {
-        const result = await pool.query(`
-          SELECT
-            COUNT(*) FILTER (
-              WHERE is_guest = FALSE
-            )::int AS total_users,
+        const [
+          totalUsers,
+          totalAdmins,
+          totalMembers,
+          totalVisitors,
+          visitorIds
+        ] = await Promise.all([
+          users.countDocuments({ is_guest: false }),
+          users.countDocuments({
+            role: 'admin',
+            is_guest: false
+          }),
+          users.countDocuments({
+            role: 'user',
+            is_guest: false
+          }),
+          users.countDocuments({ is_guest: true }),
+          users.distinct('id', { is_guest: true })
+        ]);
 
-            COUNT(*) FILTER (
-              WHERE role = 'admin' AND is_guest = FALSE
-            )::int AS total_admins,
+        let connectedVisitors = 0;
 
-            COUNT(*) FILTER (
-              WHERE role = 'user' AND is_guest = FALSE
-            )::int AS total_members,
-
-            COUNT(*) FILTER (
-              WHERE is_guest = TRUE
-            )::int AS total_visitors
-
-          FROM users
-        `);
-
-        const connectedResult = await pool.query(`
-          SELECT COUNT(*)::int AS connected_visitors
-          FROM users u
-          WHERE u.is_guest = TRUE
-          AND EXISTS (
-            SELECT 1
-            FROM whatsapp_sessions w
-            WHERE w.user_id = u.id
-              AND w.record_type = 'creds'
-              AND w.record_id = 'main'
-          )
-        `);
+        if (visitorIds.length > 0) {
+          connectedVisitors =
+            await db.collection('whatsapp_sessions').countDocuments({
+              user_id: { $in: visitorIds },
+              record_type: 'creds',
+              record_id: 'main'
+            });
+        }
 
         return send(res, 200, {
           success: true,
           stats: {
-            ...result.rows[0],
-            connected_visitors:
-              connectedResult.rows[0].connected_visitors
+            total_users: totalUsers,
+            total_admins: totalAdmins,
+            total_members: totalMembers,
+            total_visitors: totalVisitors,
+            connected_visitors: connectedVisitors
           }
         });
       }
 
-      const result = await pool.query(`
-        SELECT id, email, role, created_at
-        FROM users
-        WHERE is_guest = FALSE
-        ORDER BY created_at DESC
-        LIMIT 100
-      `);
+      const result = await users.find({
+        is_guest: false
+      })
+        .sort({ created_at: -1 })
+        .limit(100)
+        .project({
+          _id: 0,
+          id: 1,
+          email: 1,
+          role: 1,
+          created_at: 1
+        })
+        .toArray();
 
       return send(res, 200, {
         success: true,
-        users: result.rows
+        users: result
       });
     } catch (error) {
       console.error('Admin request error:', error.message);
@@ -825,15 +865,21 @@ async function handleRequest(req, res) {
     if (!admin) return;
 
     try {
-      const result = await pool.query(`
-        SELECT id, created_at
-        FROM users
-        WHERE is_guest = TRUE
-        ORDER BY created_at DESC
-        LIMIT 500
-      `);
+      const db = await getMongoDb();
 
-      const visitors = result.rows.map(visitor => ({
+      const result = await db.collection('users').find({
+        is_guest: true
+      })
+        .sort({ created_at: -1 })
+        .limit(500)
+        .project({
+          _id: 0,
+          id: 1,
+          created_at: 1
+        })
+        .toArray();
+
+      const visitors = result.map(visitor => ({
         id: visitor.id,
         createdAt: visitor.created_at,
         connectionStatus: getUserSessionStatus(visitor.id)
@@ -929,7 +975,7 @@ async function handleRequest(req, res) {
       }
     }
 
-    // ADMIN LISTS BANNED NUMBERS FOR A VISITOR BOT
+    // ADMIN LISTS BANNED NUMBERS
 
     if (
       req.method === 'GET' &&
@@ -949,16 +995,14 @@ async function handleRequest(req, res) {
       }
     }
 
-    // ADMIN BANS A NUMBER FROM A VISITOR BOT
+    // ADMIN BANS A NUMBER
 
     if (
       req.method === 'POST' &&
       action === 'ban'
     ) {
-      let body;
-
       try {
-        body = await readBody(req);
+        const body = await readBody(req);
 
         if (!body.phoneNumber) {
           return send(res, 400, {
@@ -986,16 +1030,14 @@ async function handleRequest(req, res) {
       }
     }
 
-    // ADMIN UNBANS A NUMBER FROM A VISITOR BOT
+    // ADMIN UNBANS A NUMBER
 
     if (
       req.method === 'POST' &&
       action === 'unban'
     ) {
-      let body;
-
       try {
-        body = await readBody(req);
+        const body = await readBody(req);
 
         if (!body.phoneNumber) {
           return send(res, 400, {
@@ -1033,6 +1075,7 @@ async function handleRequest(req, res) {
 }
 
 async function startServer() {
+  await getMongoDb();
   await initializeDatabase();
   await initializeSessionStorage();
   await initializeFeatureSettings();
@@ -1054,6 +1097,7 @@ async function startServer() {
 
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`SCANTY MD BOT running on port ${PORT}`);
+    console.log('Database: MongoDB Atlas');
     console.log('Allowed dashboard origin:', DASHBOARD_ORIGIN);
   });
 }
