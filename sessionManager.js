@@ -137,9 +137,7 @@ function expireQrSession(userId, expectedSocket, expectedExpiresAt) {
   console.log('WHATSAPP QR EXPIRED:', { userId });
   return true;
 }
-  return String(qr);
-}
-
+  
 function encrypt(value) {
   const iv = crypto.randomBytes(12);
 
