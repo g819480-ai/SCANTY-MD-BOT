@@ -1,3 +1,4 @@
+
 import makeWASocket, {
   initAuthCreds,
   BufferJSON,
@@ -10,8 +11,8 @@ import makeWASocket, {
 import pino from 'pino';
 import crypto from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import pg from 'pg';
 
+import { getMongoDb } from './mongo.js';
 import { handleIncomingMessage } from './messageHandler.js';
 import { handleStatusUpdate } from './statusEvents.js';
 import { getFeatureSettings } from './featureSettings.js';
@@ -22,8 +23,6 @@ import {
   reconnectIfCurrent,
   withPairingLock
 } from './whatsappLifecycle.js';
-
-const { Pool } = pg;
 
 const sessions = new Map();
 const sessionStatus = new Map();
@@ -40,16 +39,6 @@ if (!secret || secret.length < 64) {
     'SESSION_ENCRYPTION_KEY must exist and contain at least 64 characters.'
   );
 }
-
-if (!process.env.DATABASE_URL) {
-  throw new Error('DATABASE_URL is missing.');
-}
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  max: 5
-});
 
 const encryptionKey = crypto
   .createHash('sha256')
@@ -125,14 +114,24 @@ function decrypt(value) {
   ]).toString('utf8');
 }
 
-async function saveRecord(userId, type, id, value) {
-  if (value == null) {
-    await pool.query(
-      `DELETE FROM whatsapp_sessions
-       WHERE user_id=$1 AND record_type=$2 AND record_id=$3`,
-      [userId, type, id]
-    );
+/*
+ * MONGODB SESSION STORAGE
+ *
+ * Existing encrypted_data values are preserved.
+ * Do not change SESSION_ENCRYPTION_KEY.
+ */
 
+async function saveRecord(userId, type, id, value) {
+  const db = await getMongoDb();
+
+  const filter = {
+    user_id: String(userId),
+    record_type: String(type),
+    record_id: String(id)
+  };
+
+  if (value == null) {
+    await db.collection('whatsapp_sessions').deleteOne(filter);
     return;
   }
 
@@ -140,32 +139,37 @@ async function saveRecord(userId, type, id, value) {
     JSON.stringify(value, BufferJSON.replacer)
   );
 
-  await pool.query(
-    `INSERT INTO whatsapp_sessions
-      (user_id, record_type, record_id, encrypted_data)
-     VALUES ($1, $2, $3, $4)
-     ON CONFLICT (user_id, record_type, record_id)
-     DO UPDATE SET
-       encrypted_data=EXCLUDED.encrypted_data,
-       updated_at=NOW()`,
-    [userId, type, id, encrypted]
+  await db.collection('whatsapp_sessions').updateOne(
+    filter,
+    {
+      $set: {
+        encrypted_data: encrypted,
+        updated_at: new Date()
+      },
+      $setOnInsert: {
+        _id: `${userId}:${type}:${id}`,
+        ...filter
+      }
+    },
+    { upsert: true }
   );
 }
 
 async function readRecord(userId, type, id) {
-  const result = await pool.query(
-    `SELECT encrypted_data
-     FROM whatsapp_sessions
-     WHERE user_id=$1 AND record_type=$2 AND record_id=$3`,
-    [userId, type, id]
-  );
+  const db = await getMongoDb();
 
-  if (!result.rows[0]) {
+  const record = await db.collection('whatsapp_sessions').findOne({
+    user_id: String(userId),
+    record_type: String(type),
+    record_id: String(id)
+  });
+
+  if (!record) {
     return null;
   }
 
   return JSON.parse(
-    decrypt(result.rows[0].encrypted_data),
+    decrypt(record.encrypted_data),
     BufferJSON.reviver
   );
 }
@@ -314,6 +318,7 @@ async function sendScantyWelcome(userId, sock) {
     );
   }
 }
+
 function getReconnectController(userId, state, captureQr) {
   const existing = reconnectControllers.get(userId);
 
@@ -667,25 +672,37 @@ async function attachSocket(
 
   return sock;
 }
+
+/*
+ * Initialize MongoDB indexes for WhatsApp session records.
+ */
+
 export async function initializeSessionStorage() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS whatsapp_sessions (
-      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      record_type TEXT NOT NULL,
-      record_id TEXT NOT NULL,
-      encrypted_data TEXT NOT NULL,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (user_id, record_type, record_id)
-    )
-  `);
+  const db = await getMongoDb();
+
+  await db.collection('whatsapp_sessions').createIndex(
+    {
+      user_id: 1,
+      record_type: 1,
+      record_id: 1
+    },
+    {
+      unique: true
+    }
+  );
+
+  console.log('MongoDB WhatsApp session storage initialized.');
 }
 
 export async function restoreUserSessions() {
-  const result = await pool.query(
-    `SELECT DISTINCT user_id
-     FROM whatsapp_sessions
-     WHERE record_type = 'creds'
-       AND record_id = 'main'`
+  const db = await getMongoDb();
+
+  const userIds = await db.collection('whatsapp_sessions').distinct(
+    'user_id',
+    {
+      record_type: 'creds',
+      record_id: 'main'
+    }
   );
 
   let restored = 0;
@@ -693,10 +710,10 @@ export async function restoreUserSessions() {
   let failed = 0;
 
   console.log(
-    `Found ${result.rows.length} saved WhatsApp credential record(s).`
+    `Found ${userIds.length} saved WhatsApp credential record(s).`
   );
 
-  for (const { user_id: userId } of result.rows) {
+  for (const userId of userIds) {
     if (sessions.has(userId)) {
       continue;
     }
@@ -731,7 +748,7 @@ export async function restoreUserSessions() {
   }
 
   console.log('SESSION RESTORE SUMMARY:', {
-    found: result.rows.length,
+    found: userIds.length,
     restored,
     unregistered,
     failed
