@@ -1,0 +1,54 @@
+
+name: Baseline Verification (npm ci)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: baseline-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  clean-install:
+    name: npm ci, check and test on Node 20
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js 20 without caching
+        uses: actions/setup-node@v5
+        with:
+          node-version: 20
+
+      - name: Prepare a clean npm cache directory
+        run: |
+          CACHE_DIR="${{ runner.temp }}/npm-cache-${{ github.run_id }}"
+          rm -rf "$CACHE_DIR"
+          mkdir -p "$CACHE_DIR"
+          echo "npm_config_cache=$CACHE_DIR" >> "$GITHUB_ENV"
+          echo "Fresh npm cache: $CACHE_DIR"
+          echo "Entries after creation: $(find "$CACHE_DIR" -mindepth 1 | wc -l)"
+
+      - name: Record environment
+        run: |
+          node --version
+          npm --version
+          echo "npm cache: $(npm config get cache)"
+          du -sh "$(npm config get cache)" 2>/dev/null || echo "npm cache is empty"
+
+      - name: Install exactly from package-lock.json
+        run: npm ci
+
+      - name: Syntax checks
+        run: npm run check
+
+      - name: Automated tests
+        run: npm test
