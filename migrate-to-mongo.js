@@ -1,3 +1,4 @@
+
 import 'dotenv/config';
 import pg from 'pg';
 import { getMongoDb, closeMongoConnection } from './mongo.js';
@@ -18,13 +19,17 @@ const pool = new Pool({
 async function writeDocuments(collection, rows, makeDocument) {
   if (rows.length === 0) return;
 
-  const operations = rows.map(row => ({
-    replaceOne: {
-      filter: { _id: makeDocument(row)._id },
-      replacement: makeDocument(row),
-      upsert: true
-    }
-  }));
+  const operations = rows.map(row => {
+    const document = makeDocument(row);
+
+    return {
+      replaceOne: {
+        filter: { _id: document._id },
+        replacement: document,
+        upsert: true
+      }
+    };
+  });
 
   for (let i = 0; i < operations.length; i += 500) {
     await collection.bulkWrite(
@@ -36,16 +41,11 @@ async function writeDocuments(collection, rows, makeDocument) {
 
 async function migrate() {
   const db = await getMongoDb();
-
   const migrations = db.collection('_migration_runs');
   const migrationId = 'neon-to-mongo-v1';
 
-  const existing = await migrations.findOne({ _id: migrationId });
-
-  if (existing) {
-    throw new Error(
-      'This migration has already been completed. Stopping to prevent overwriting data.'
-    );
+  if (await migrations.findOne({ _id: migrationId })) {
+    throw new Error('Migration already completed. Stopping.');
   }
 
   console.log('Reading records from Neon PostgreSQL...');
@@ -65,8 +65,9 @@ async function migrate() {
     FROM bot_settings
   `);
 
+  // Use the actual existing Neon column names.
   const bansResult = await pool.query(`
-    SELECT owner_user_id, phone_number, created_at
+    SELECT user_id, phone_number, banned_at
     FROM bot_bans
   `);
 
@@ -127,10 +128,10 @@ async function migrate() {
     db.collection('bot_bans'),
     bansResult.rows,
     row => ({
-      _id: `${row.owner_user_id}:${row.phone_number}`,
-      owner_user_id: String(row.owner_user_id),
+      _id: `${row.user_id}:${row.phone_number}`,
+      user_id: String(row.user_id),
       phone_number: row.phone_number,
-      created_at: row.created_at
+      banned_at: row.banned_at
     })
   );
 
@@ -146,7 +147,7 @@ async function migrate() {
   });
 
   await db.collection('bot_bans').createIndex({
-    owner_user_id: 1,
+    user_id: 1,
     phone_number: 1
   });
 
