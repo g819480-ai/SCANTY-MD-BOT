@@ -11,7 +11,21 @@ import {
 const DEFAULT_PREFIX = '.';
 const COMMAND_COOLDOWN_MS = 3000;
 const AI_COOLDOWN_MS = 4000;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+
+const GEMINI_MODEL =
+  process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+
+const GEMINI_FALLBACK_MODELS = (
+  process.env.GEMINI_FALLBACK_MODELS ||
+  'gemini-3.5-flash-lite,gemini-3.1-flash-lite'
+)
+  .split(',')
+  .map(model => model.trim())
+  .filter(Boolean);
+
+const GEMINI_TEMPORARY_ERRORS = new Set([
+  429, 500, 502, 503, 504
+]);
 
 const lastCommands = new Map();
 const lastAIReplies = new Map();
@@ -19,8 +33,12 @@ const MAX_RATE_LIMIT_ENTRIES = 5000;
 
 function normalizeJid(jid) {
   if (typeof jid !== 'string') return '';
+
   const [user, server] = jid.split('@');
-  return user && server ? `${user.split(':')[0]}@${server}` : '';
+
+  return user && server
+    ? `${user.split(':')[0]}@${server}`
+    : '';
 }
 
 function getMessageText(message) {
@@ -35,6 +53,7 @@ function getMessageText(message) {
       content.documentWithCaptionMessage?.message;
 
     if (!wrapped) break;
+
     content = wrapped;
   }
 
@@ -55,7 +74,9 @@ function isOwnerSelfChat(sock, message, chatId) {
     chatId.endsWith('@g.us') ||
     chatId.endsWith('@newsletter') ||
     chatId === 'status@broadcast'
-  ) return false;
+  ) {
+    return false;
+  }
 
   return [sock.user?.id, sock.user?.lid]
     .map(normalizeJid)
@@ -105,17 +126,23 @@ function isAIRateLimited(key) {
 
 function phoneFromJid(jid) {
   const id = normalizeJid(jid).split('@')[0];
+
   return /^\d{7,15}$/.test(id) ? id : '';
 }
 
 function parseEmojis(input) {
-  const values = input.split(',').map(value => value.trim()).filter(Boolean);
+  const values = input
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean);
 
   if (
     values.length < 1 ||
     values.length > 10 ||
     values.some(value => value.length > 16)
-  ) return null;
+  ) {
+    return null;
+  }
 
   return [...new Set(values)];
 }
@@ -182,22 +209,27 @@ function menuText() {
   ].join('\n');
 }
 
-
 async function generateGeminiReply(userText) {
   const apiKey = process.env.GEMINI_API_KEY;
 
   if (!apiKey) {
-    throw new Error('GEMINI_API_KEY is missing from the environment.');
+    throw new Error(
+      'GEMINI_API_KEY is missing from the environment.'
+    );
   }
 
   const models = [
-    ...new Set([GEMINI_MODEL, ...GEMINI_FALLBACK_MODELS])
+    ...new Set([
+      GEMINI_MODEL,
+      ...GEMINI_FALLBACK_MODELS
+    ])
   ];
 
-  const temporaryErrors = [429, 500, 502, 503, 504];
   let lastError;
 
-  for (const model of models) {
+  for (let index = 0; index < models.length; index += 1) {
+    const model = models[index];
+
     try {
       console.log('GEMINI REQUEST:', { model });
 
@@ -220,12 +252,27 @@ async function generateGeminiReply(userText) {
                   'Keep answers reasonably concise and suitable for WhatsApp.'
               }]
             },
-          
+            contents: [{
+              role: 'user',
+              parts: [{
+                text: userText.slice(0, 4000)
+              }]
+            }],
+            generationConfig: {
+              temperature: 0.7,
+              maxOutputTokens: 700
+            }
+          }),
+          signal: AbortSignal.timeout(25000)
+        }
+      );
+
       const data = await response.json().catch(() => ({}));
 
       if (!response.ok) {
         const error = new Error(
-          data?.error?.message || `Gemini API error (${response.status}).`
+          data?.error?.message ||
+          `Gemini API error (${response.status}).`
         );
 
         error.status = response.status;
@@ -249,7 +296,23 @@ async function generateGeminiReply(userText) {
     } catch (error) {
       lastError = error;
 
-      const shouldFallbac
+      const isTemporaryHttpError =
+        GEMINI_TEMPORARY_ERRORS.has(error.status);
+
+      const isNetworkOrTimeoutError =
+        error.name === 'AbortError' ||
+        error.name === 'TimeoutError' ||
+        error.name === 'TypeError';
+
+      const shouldFallback =
+        index < models.length - 1 &&
+        (isTemporaryHttpError || isNetworkOrTimeoutError);
+
+      console.error('Gemini model failed:', {
+        model,
+        status: error.status || null,
+        message: error.message
+      });
 
       if (!shouldFallback) {
         throw error;
@@ -268,44 +331,11 @@ async function generateGeminiReply(userText) {
   );
 }
 
-        contents: [{
-          role: 'user',
-          parts: [{ text: userText.slice(0, 4000) }]
-        }],
-        generationConfig: {
-          temperature: 0.7,
-          maxOutputTokens: 700
-        }
-      }),
-      signal: AbortSignal.timeout(25000)
-    }
-  );
-
-  const data = await response.json().catch(() => ({}));
-
-  if (!response.ok) {
-    console.error(
-      'Gemini API error:',
-      response.status,
-      data?.error?.message || 'Unknown API error'
-    );
-
-    throw new Error(`Gemini API request failed (${response.status}).`);
-  }
-
-  const answer = data?.candidates?.[0]?.content?.parts
-    ?.map(part => part.text || '')
-    .join('')
-    .trim();
-
-  if (!answer) {
-    throw new Error('Gemini returned an empty response.');
-  }
-
-  return answer.slice(0, 4000);
-}
-
-export async function handleIncomingMessage(sock, userId, message) {
+export async function handleIncomingMessage(
+  sock,
+  userId,
+  message
+) {
   if (!message?.key) return;
 
   const chatId = message.key.remoteJid;
@@ -314,13 +344,20 @@ export async function handleIncomingMessage(sock, userId, message) {
     !chatId ||
     chatId === 'status@broadcast' ||
     chatId.endsWith('@newsletter')
-  ) return;
+  ) {
+    return;
+  }
 
-  const selfChat = isOwnerSelfChat(sock, message, chatId);
+  const selfChat = isOwnerSelfChat(
+    sock,
+    message,
+    chatId
+  );
 
   if (message.key.fromMe && !selfChat) return;
 
   const text = getMessageText(message);
+
   if (!text) return;
 
   const senderJid = selfChat
@@ -336,9 +373,12 @@ export async function handleIncomingMessage(sock, userId, message) {
       !selfChat &&
       senderPhone &&
       await isBotUserBanned(userId, senderPhone)
-    ) return;
+    ) {
+      return;
+    }
 
     settings = await getFeatureSettings(userId);
+
   } catch (error) {
     console.error('Message handler setup error:', error);
 
@@ -346,18 +386,23 @@ export async function handleIncomingMessage(sock, userId, message) {
       await sock.sendMessage(
         chatId,
         {
-          text: '❌ SCANTY MD BOT could not process this message right now. Please try again later.'
+          text:
+            '❌ SCANTY MD BOT could not process this message right now. Please try again later.'
         },
         { quoted: message }
       );
     } catch (sendError) {
-      console.error('Could not send setup error reply:', sendError);
+      console.error(
+        'Could not send setup error reply:',
+        sendError
+      );
     }
 
     return;
   }
 
   const prefix = settings.prefix || DEFAULT_PREFIX;
+
   const reply = response =>
     sock.sendMessage(
       chatId,
@@ -375,7 +420,9 @@ export async function handleIncomingMessage(sock, userId, message) {
 
     try {
       const answer = await generateGeminiReply(text);
+
       await reply(answer);
+
     } catch (error) {
       console.error('Gemini reply error:', error);
 
@@ -384,7 +431,10 @@ export async function handleIncomingMessage(sock, userId, message) {
           '⚠️ SCANTY MD BOT AI is temporarily unavailable. Please try again shortly.'
         );
       } catch (sendError) {
-        console.error('Could not send Gemini error reply:', sendError);
+        console.error(
+          'Could not send Gemini error reply:',
+          sendError
+        );
       }
     }
 
@@ -400,7 +450,9 @@ export async function handleIncomingMessage(sock, userId, message) {
   const command = (parts.shift() || '').toLowerCase();
   const args = parts;
 
-  if (!command || isRateLimited(`${userId}:${senderJid}`)) return;
+  if (!command || isRateLimited(`${userId}:${senderJid}`)) {
+    return;
+  }
 
   const ownerOnly = async () => {
     if (selfChat) return true;
@@ -443,7 +495,9 @@ export async function handleIncomingMessage(sock, userId, message) {
       }
 
       case 'ping':
-        return reply('🏓 SCANTY MD BOT is responding.');
+        return reply(
+          '🏓 SCANTY MD BOT is responding.'
+        );
 
       case 'uptime':
         return reply(
@@ -461,7 +515,9 @@ export async function handleIncomingMessage(sock, userId, message) {
 
       case 'groupinfo': {
         if (!chatId.endsWith('@g.us')) {
-          return reply('This command only works in a group.');
+          return reply(
+            'This command only works in a group.'
+          );
         }
 
         const metadata = await sock.groupMetadata(chatId);
@@ -472,20 +528,26 @@ export async function handleIncomingMessage(sock, userId, message) {
           `ID: ${metadata.id || chatId}`,
           `Members: ${metadata.participants?.length || 0}`,
           `Admins: ${admins.length}`,
-          metadata.desc ? `Description: ${metadata.desc}` : null
+          metadata.desc
+            ? `Description: ${metadata.desc}`
+            : null
         ].filter(Boolean).join('\n'));
       }
 
       case 'admins': {
         if (!chatId.endsWith('@g.us')) {
-          return reply('This command only works in a group.');
+          return reply(
+            'This command only works in a group.'
+          );
         }
 
         const metadata = await sock.groupMetadata(chatId);
         const admins = getGroupAdmins(metadata);
 
         if (!admins.length) {
-          return reply('No group admins were returned.');
+          return reply(
+            'No group admins were returned.'
+          );
         }
 
         return reply(
@@ -533,7 +595,11 @@ export async function handleIncomingMessage(sock, userId, message) {
           );
         }
 
-        await setFeatureSetting(userId, 'statusEmojis', emojis);
+        await setFeatureSetting(
+          userId,
+          'statusEmojis',
+          emojis
+        );
 
         return reply(
           `✅ Status emojis saved: ${emojis.join(' ')}`
@@ -551,7 +617,10 @@ export async function handleIncomingMessage(sock, userId, message) {
           );
         }
 
-        const added = await banBotUser(userId, target);
+        const added = await banBotUser(
+          userId,
+          target
+        );
 
         return reply(
           added
@@ -566,7 +635,9 @@ export async function handleIncomingMessage(sock, userId, message) {
         const bans = await listBotBans(userId);
 
         if (!bans.length) {
-          return reply('There are no numbers banned from this bot.');
+          return reply(
+            'There are no numbers banned from this bot.'
+          );
         }
 
         return reply(
@@ -583,7 +654,8 @@ export async function handleIncomingMessage(sock, userId, message) {
           message.message?.extendedTextMessage?.contextInfo
             ?.mentionedJid?.[0];
 
-        const target = args[0] || phoneFromJid(mention);
+        const target =
+          args[0] || phoneFromJid(mention);
 
         if (!target) {
           return reply(
@@ -591,7 +663,10 @@ export async function handleIncomingMessage(sock, userId, message) {
           );
         }
 
-        const removed = await unbanBotUser(userId, target);
+        const removed = await unbanBotUser(
+          userId,
+          target
+        );
 
         return reply(
           removed
@@ -607,7 +682,9 @@ export async function handleIncomingMessage(sock, userId, message) {
           const value = args[0]?.toLowerCase();
 
           if (!['on', 'off'].includes(value)) {
-            return reply(`Usage: ${prefix}${command} on/off`);
+            return reply(
+              `Usage: ${prefix}${command} on/off`
+            );
           }
 
           await setFeatureSetting(
@@ -625,6 +702,7 @@ export async function handleIncomingMessage(sock, userId, message) {
           `Unknown command: ${prefix}${command}\nSend ${prefix}menu to see supported commands.`
         );
     }
+
   } catch (error) {
     console.error('Message handler error:', error);
 
@@ -633,7 +711,10 @@ export async function handleIncomingMessage(sock, userId, message) {
         '❌ Could not complete that command right now. Please try again later.'
       );
     } catch (sendError) {
-      console.error('Could not send command error reply:', sendError);
+      console.error(
+        'Could not send command error reply:',
+        sendError
+      );
     }
   }
 }
