@@ -311,7 +311,7 @@ export async function handleIncomingMessage(sock, userId, message) {
 
     const aiKey = `${userId}:${chatId}`;
 
-    if (isAI rateLimited(aiKey)) return;
+    if (isAIRateLimited(aiKey)) return;
 
     try {
       const answer = await generateGeminiReply(text);
