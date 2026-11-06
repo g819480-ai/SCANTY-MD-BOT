@@ -156,39 +156,133 @@ export async function withPairingLock(locks, userId, action) {
 }
 
 /** Wait for the WebSocket transport to open before requesting a pairing code. */
+const WRAPPER_OPEN_STATE = 1;
+const WRAPPER_CLOSING_STATE = 2;
+const WRAPPER_CLOSED_STATE = 3;
+
+function isSocketOpen(ws) {
+  if (!ws) return false;
+
+  if (ws.isClosed === true || ws.isClosing === true) {
+    return false;
+  }
+
+  if (ws.isOpen === true) return true;
+  if (ws.isOpen === false) return false;
+
+  return ws.readyState === (ws.OPEN ?? WRAPPER_OPEN_STATE);
+}
+
+function socketIsClosedOrClosing(ws) {
+  if (!ws) return true;
+
+  if (ws.isClosed === true || ws.isClosing === true) {
+    return true;
+  }
+
+  if (ws.isOpen === true || ws.isOpen === false) {
+    return false;
+  }
+
+  return (
+    ws.readyState === WRAPPER_CLOSING_STATE ||
+    ws.readyState === WRAPPER_CLOSED_STATE
+  );
+}
+
 export function waitForSocketReady(sock, timeoutMs = 20000) {
   const ws = sock?.ws;
-  if (!ws) return Promise.reject(new Error('WhatsApp WebSocket is unavailable.'));
-  const openState = ws.OPEN ?? 1;
-  if (ws.readyState === openState) return Promise.resolve();
+
+  if (!ws) {
+    return Promise.reject(
+      new Error('WhatsApp WebSocket is unavailable.')
+    );
+  }
+
+  if (socketIsClosedOrClosing(ws)) {
+    return Promise.reject(
+      new Error('WhatsApp WebSocket is already closed or closing.')
+    );
+  }
+
+  if (isSocketOpen(ws)) return Promise.resolve();
 
   return new Promise((resolve, reject) => {
     let timer;
+    let settled = false;
+
     const cleanup = () => {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
+
       ws.off?.('open', onOpen);
       ws.off?.('error', onError);
       ws.off?.('close', onClose);
+
       ws.removeListener?.('open', onOpen);
       ws.removeListener?.('error', onError);
       ws.removeListener?.('close', onClose);
     };
-    const onOpen = () => { cleanup(); resolve(); };
-    const onError = error => {
+
+    const settle = (error) => {
+      if (settled) return;
+      settled = true;
       cleanup();
-      reject(error || new Error('WhatsApp WebSocket failed.'));
+
+      if (error) reject(error);
+      else resolve();
     };
+
+    const onOpen = () => {
+      if (socketIsClosedOrClosing(ws)) {
+        settle(new Error(
+          'WhatsApp WebSocket closed before becoming ready.'
+        ));
+        return;
+      }
+
+      if (!isSocketOpen(ws)) return;
+
+      settle();
+    };
+
+    const onError = (error) => {
+      settle(
+        error instanceof Error
+          ? error
+          : new Error('WhatsApp WebSocket failed.')
+      );
+    };
+
     const onClose = () => {
-      cleanup();
-      reject(new Error('WhatsApp WebSocket closed before pairing.'));
+      settle(
+        new Error('WhatsApp WebSocket closed before pairing.')
+      );
     };
+
+    ws.on('open', onOpen);
+    ws.on('error', onError);
+    ws.on('close', onClose);
+
+    if (settled) return;
+
+    if (socketIsClosedOrClosing(ws)) {
+      settle(new Error(
+        'WhatsApp WebSocket closed before becoming ready.'
+      ));
+      return;
+    }
+
+    if (isSocketOpen(ws)) {
+      settle();
+      return;
+    }
+
     timer = setTimeout(() => {
-      cleanup();
-      reject(new Error('Timed out waiting for WhatsApp WebSocket readiness.'));
+      settle(
+        new Error(
+          'Timed out waiting for WhatsApp WebSocket readiness.'
+        )
+      );
     }, timeoutMs);
-    ws.once('open', onOpen);
-    ws.once('error', onError);
-    ws.once('close', onClose);
-    if (ws.readyState === openState) onOpen();
   });
 }

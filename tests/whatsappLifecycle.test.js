@@ -281,3 +281,56 @@ test('phone pairing readiness rejects WebSocket close before open', async () => 
   ws.emit('close');
   await assert.rejects(ready, /closed before pairing/);
 });
+test('phone pairing readiness accepts Baileys v7 isOpen flag', async () => {
+  const ws = new EventEmitter();
+  ws.isOpen = true;
+  ws.readyState = 0;
+
+  await waitForSocketReady({ ws }, 1000);
+});
+
+test('phone pairing readiness rejects an already closed socket', async () => {
+  const ws = new EventEmitter();
+  ws.isClosed = true;
+
+  await assert.rejects(
+    waitForSocketReady({ ws }, 1000),
+    /closed|closing/i
+  );
+});
+
+test('phone pairing readiness rejects an already closing socket', async () => {
+  const ws = new EventEmitter();
+  ws.isClosing = true;
+
+  await assert.rejects(
+    waitForSocketReady({ ws }, 1000),
+    /closed|closing/i
+  );
+});
+
+test('phone pairing readiness ignores open until Baileys v7 isOpen is true', async () => {
+  const ws = new EventEmitter();
+  ws.isOpen = false;
+  ws.readyState = 0;
+
+  const ready = waitForSocketReady({ ws }, 1000);
+
+  ws.emit('open');
+  await Promise.resolve();
+
+  ws.isOpen = true;
+  ws.emit('open');
+
+  await ready;
+});
+
+test('phone pairing readiness rejects WebSocket errors', async () => {
+  const ws = new EventEmitter();
+  ws.readyState = 0;
+
+  const ready = waitForSocketReady({ ws }, 1000);
+  ws.emit('error', new Error('Test WebSocket error'));
+
+  await assert.rejects(ready, /Test WebSocket error/);
+});
