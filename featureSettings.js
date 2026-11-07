@@ -37,11 +37,10 @@ export async function initializeFeatureSettings() {
     { unique: true }
   );
 
-  await db.collection('bot_bans').createIndex(
-    { user_id: 1, phone_number: 1 },
-    { unique: true }
-  );
-}
+  await db.collection('bot_bans').createIndex({
+  user_id: 1,
+  phone_number: 1
+});
 
 export async function getFeatureSettings(userId) {
   const db = await getMongoDb();
