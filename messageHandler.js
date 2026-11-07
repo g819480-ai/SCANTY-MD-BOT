@@ -542,90 +542,179 @@ export async function handleIncomingMessage(
     'success'
   );
 }
-      case 'uptime':
-        return reply(
-          `⏱️ Bot uptime: ${formatUptime(process.uptime())}`
-        );
+      case 'uptime': {
+  const uptimeSeconds = Math.floor(process.uptime());
+  const uptime = formatUptime(uptimeSeconds);
 
-      case 'jid':
-        return reply(
-          `Chat: ${chatId}\nSender: ${senderJid}${
-            message.key.participant
-              ? `\nParticipant: ${message.key.participant}`
-              : ''
-          }`
-        );
+  return reply(
+    '⏱️ SERVER UPTIME REPORT\n\n' +
+    '🤖 BOT: SCANTY MD BOT\n' +
+    `⚡ Running Time: ${uptime}\n` +
+    `🔢 Total Seconds: ${uptimeSeconds.toLocaleString()}s\n` +
+    '🟢 Server Status: ACTIVE\n\n' +
+    '🚀 SCANTY MD BOT is running smoothly.',
+    'success'
+  );
+}
+      case 'jid': {
+  const isGroup = chatId.endsWith('@g.us');
 
-      case 'groupinfo': {
-        if (!chatId.endsWith('@g.us')) {
-          return reply(
-            'This command only works in a group.'
-          );
-        }
+  return reply(
+    '🆔 WHATSAPP IDENTITY REPORT\n\n' +
+    '🤖 BOT: SCANTY MD BOT\n\n' +
+    `💬 Chat Type: ${isGroup ? 'GROUP' : 'PRIVATE CHAT'}\n` +
+    `📌 Chat ID: ${chatId}\n` +
+    `👤 Sender ID: ${senderJid}\n` +
+    `👥 Participant: ${message.key.participant || 'Not applicable'}\n\n` +
+    '🔴 ID INFORMATION GENERATED SUCCESSFULLY.',
+    'success'
+  );
+} 
+        case 'groupinfo': {
+  if (!chatId.endsWith('@g.us')) {
+    return reply(
+      'This command only works in a WhatsApp group.',
+      'warning'
+    );
+  }
 
-        const metadata = await sock.groupMetadata(chatId);
-        const admins = getGroupAdmins(metadata);
+  try {
+    const metadata = await sock.groupMetadata(chatId);
+    const admins = getGroupAdmins(metadata);
 
-        return reply([
-          `Group: ${metadata.subject || '(unnamed)'}`,
-          `ID: ${metadata.id || chatId}`,
-          `Members: ${metadata.participants?.length || 0}`,
-          `Admins: ${admins.length}`,
-          metadata.desc
-            ? `Description: ${metadata.desc}`
-            : null
-        ].filter(Boolean).join('\n'));
-      }
+    const owner = metadata.owner || 'Not available';
+    const members = metadata.participants?.length || 0;
 
-      case 'admins': {
-        if (!chatId.endsWith('@g.us')) {
-          return reply(
-            'This command only works in a group.'
-          );
-        }
+    return reply(
+      '👥 GROUP INFORMATION REPORT\n\n' +
+      `📛 Group Name: ${metadata.subject || 'Unnamed'}\n` +
+      `🆔 Group ID: ${metadata.id || chatId}\n` +
+      `👑 Group Owner: ${owner}\n` +
+      `👥 Total Members: ${members}\n` +
+      `🛡️ Total Admins: ${admins.length}\n\n` +
+      '📝 GROUP DESCRIPTION\n' +
+      `${metadata.desc || 'No description available.'}\n\n` +
+      '🔴 SCANTY MD BOT GROUP REPORT',
+      'success'
+    );
+  } catch (error) {
+    console.error('Group info error:', error);
 
-        const metadata = await sock.groupMetadata(chatId);
-        const admins = getGroupAdmins(metadata);
+    return reply(
+      'Unable to retrieve group information. Please try again.',
+      'error'
+    );
+  }
+}
 
-        if (!admins.length) {
-          return reply(
-            'No group admins were returned.'
-          );
-        }
+    case 'admins': {
+  if (!chatId.endsWith('@g.us')) {
+    return reply(
+      'This command only works in a WhatsApp group.',
+      'warning'
+    );
+  }
 
-        return reply(
-          `Group admins (${admins.length}):\n${admins
-            .map(jid => `• ${jid}`)
-            .join('\n')}`
-        );
-      }
+  try {
+    const metadata = await sock.groupMetadata(chatId);
+    const admins = getGroupAdmins(metadata);
 
+    if (!admins.length) {
+      return reply(
+        'No group administrators were found.',
+        'warning'
+      );
+    }
+
+    const owner = metadata.owner;
+
+    const adminList = admins.map((jid, index) => {
+      const isOwner = owner === jid;
+
+      return (
+        `${index + 1}. ${isOwner ? '👑 GROUP OWNER' : '🛡️ ADMIN'}\n` +
+        `   📱 ${jid}`
+      );
+    }).join('\n\n');
+
+    return reply(
+      '🛡️ GROUP ADMINISTRATION REPORT\n\n' +
+      `📛 Group: ${metadata.subject || 'Unnamed'}\n` +
+      `👥 Total Admins: ${admins.length}\n\n` +
+      '━━━━━━━━━━━━━━━━━━\n' +
+      adminList +
+      '\n\n━━━━━━━━━━━━━━━━━━\n' +
+      '🔴 POWERED BY SCANTY',
+      'success'
+    );
+
+  } catch (error) {
+    console.error('Admins command error:', error);
+
+    return reply(
+      'Unable to retrieve the group administrators.',
+      'error'
+    );
+  }
+}
+     
       case 'status': {
-        const open =
-          sock.ws?.readyState === (sock.ws?.OPEN ?? 1) &&
-          Boolean(sock.user);
+  const open =
+    sock.ws?.readyState === (sock.ws?.OPEN ?? 1) &&
+    Boolean(sock.user);
 
-        return reply(
-          `${open ? '✅ Connected' : '⚠️ Not connected'}\nAccount: ${
-            sock.user?.id || 'unknown'
-          }\nPrefix: ${prefix}`
-        );
-      }
+  const uptimeSeconds = Math.floor(process.uptime());
+  const hours = Math.floor(uptimeSeconds / 3600);
+  const minutes = Math.floor((uptimeSeconds % 3600) / 60);
+  const seconds = uptimeSeconds % 60;
 
-      case 'settings':
-        return reply([
-          'SCANTY MD BOT SETTINGS',
-          `Always Online: ${settings.alwaysOnline ? 'ON' : 'OFF'}`,
-          `Auto View Status: ${settings.autoViewStatus ? 'ON' : 'OFF'}`,
-          `Status Reactions: ${settings.statusReact ? 'ON' : 'OFF'}`,
-          `Anti-link: ${settings.antiLink ? 'ON' : 'OFF'}`,
-          `Welcome: ${settings.welcome ? 'ON' : 'OFF'}`,
-          `Goodbye: ${settings.goodbye ? 'ON' : 'OFF'}`,
-          `Auto React: ${settings.autoReact ? 'ON' : 'OFF'}`,
-          `Gemini AI: ${settings.aiChatEnabled ? 'ON' : 'OFF'}`,
-          `Status emojis: ${(settings.statusEmojis || []).join(' ')}`,
-          `Prefix: ${prefix}`
-        ].join('\n'));
+  const uptime = `${hours}h ${minutes}m ${seconds}s`;
+
+  const now = new Date().toLocaleString('en-GB', {
+    timeZone: 'Africa/Accra',
+    dateStyle: 'medium',
+    timeStyle: 'medium'
+  });
+
+  return reply(
+    '📡 SYSTEM STATUS REPORT\n\n' +
+    `🤖 Bot: SCANTY MD BOT\n` +
+    `🔌 Connection: ${open ? 'CONNECTED' : 'DISCONNECTED'}\n` +
+    `👤 Account: ${sock.user?.id || 'Unknown'}\n` +
+    `📌 Prefix: ${prefix}\n` +
+    `⏱️ Server Uptime: ${uptime}\n` +
+    `🕒 Ghana Time: ${now}\n\n` +
+    `${open ? '🟢 All systems operational.' : '🟠 WhatsApp connection needs attention.'}`,
+    open ? 'success' : 'warning'
+  );
+}
+
+
+case 'settings': {
+  const indicator = value => value ? '🟢 ON' : '🔴 OFF';
+
+  return reply([
+    '⚙️ BOT CONFIGURATION PANEL',
+    '',
+    '╭━━〔 🔴 SYSTEM SETTINGS 〕━━',
+    `┃ Always Online: ${indicator(settings.alwaysOnline)}`,
+    `┃ Auto View Status: ${indicator(settings.autoViewStatus)}`,
+    `┃ Status Reactions: ${indicator(settings.statusReact)}`,
+    `┃ Anti-link: ${indicator(settings.antiLink)}`,
+    '┣━━〔 👥 GROUP FEATURES 〕━━',
+    `┃ Welcome: ${indicator(settings.welcome)}`,
+    `┃ Goodbye: ${indicator(settings.goodbye)}`,
+    `┃ Auto React: ${indicator(settings.autoReact)}`,
+    '┣━━〔 🤖 AI CONFIGURATION 〕━━',
+    `┃ Gemini AI: ${indicator(settings.aiChatEnabled)}`,
+    '┣━━〔 📌 PREFERENCES 〕━━',
+    `┃ Status Emojis: ${(settings.statusEmojis || []).join(' ') || 'Not set'}`,
+    `┃ Command Prefix: ${prefix}`,
+    '╰━━━━━━━━━━━━━━━━━━━━',
+    '',
+    '🔴 SCANTY MD BOT CONTROL PANEL'
+  ].join('\n'), 'info');
+}
 
       case 'setemojis': {
         if (!(await ownerOnly())) return;
