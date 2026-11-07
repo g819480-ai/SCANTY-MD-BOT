@@ -948,27 +948,30 @@ export async function startUserSession(
         );
       }
 
-      if (sessions.has(userId)) {
-        throw new Error(
-          'A WhatsApp session is already active for this user.'
-        );
-      }
-
       const savedCreds = await readRecord(
-        userId,
-        'creds',
-        'main'
-      );
+  userId,
+  'creds',
+  'main'
+);
 
-      if (savedCreds?.registered) {
-        throw new Error(
-          'This WhatsApp account is already linked.'
-        );
-      }
+if (savedCreds?.registered) {
+  throw new Error(
+    'This WhatsApp account is already linked.'
+  );
+}
 
-      qrStates.delete(userId);
+if (
+  sessions.has(userId) &&
+  !cancelPendingQrAttempt(userId)
+) {
+  throw new Error(
+    'A WhatsApp session is already active for this user.'
+  );
+}
 
-      const state = makeAuthState(userId, savedCreds);
+qrStates.delete(userId);
+
+const state = makeAuthState(userId, savedCreds);
 
       let resolveReady;
       let rejectReady;
