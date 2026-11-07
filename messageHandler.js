@@ -1,3 +1,11 @@
+import {
+  styleMessage,
+  successMessage,
+  errorMessage,
+  warningMessage,
+  infoMessage,
+  menuMessage
+} from './messageStyle.js';
 
 import {
   getFeatureSettings,
