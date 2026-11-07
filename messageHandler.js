@@ -190,32 +190,56 @@ const toggleSettings = Object.freeze({
   autoreact: 'autoReact'
 });
 
+
 function menuText() {
   return [
-    '╭━━〔 SCANTY MD BOT 〕━━╮',
-    '┃ .menu / .help',
-    '┃ .ping',
-    '┃ .status',
-    '┃ .uptime',
-    '┃ .jid',
-    '┃ .groupinfo (groups)',
-    '┃ .admins (groups)',
-    '┃ .settings',
-    '┃ .ai on/off (owner only)',
-    '┃ .alwaysonline on/off',
-    '┃ .autoviewstatus on/off',
-    '┃ .statusreact on/off',
-    '┃ .antilink on/off',
-    '┃ .welcome on/off',
-    '┃ .goodbye on/off',
-    '┃ .autoreact on/off',
-    '┃ .setemojis ❤️,🔥,😍',
-    '┃ .ban <phone number> (owner only)',
-    '┃ .bans / .unban <phone number> (owner only)',
-    '┃ Note: unban removes a bot-access ban; it does not add anyone to a WhatsApp group.',
-    '╰━━━━━━━━━━━━━━━━━━╯'
+    '╭━━━〔 🔴 SCANTY MD BOT 〕━━━╮',
+    '┃',
+    '┃  ⚡ SYSTEM STATUS: ONLINE',
+    '┃  🤖 WHATSAPP AUTOMATION',
+    '┃  📌 PREFIX: .',
+    '┃',
+    '┣━━━〔 📡 GENERAL COMMANDS 〕━━━',
+    '┃',
+    '┃  ▸ .menu / .help',
+    '┃  ▸ .ping',
+    '┃  ▸ .status',
+    '┃  ▸ .uptime',
+    '┃  ▸ .jid',
+    '┃',
+    '┣━━━〔 👥 GROUP COMMANDS 〕━━━',
+    '┃',
+    '┃  ▸ .groupinfo',
+    '┃  ▸ .admins',
+    '┃  ▸ .antilink on/off',
+    '┃',
+    '┣━━━〔 ⚙️ BOT SETTINGS 〕━━━',
+    '┃',
+    '┃  ▸ .settings',
+    '┃  ▸ .ai on/off (Owner)',
+    '┃  ▸ .alwaysonline on/off',
+    '┃  ▸ .autoviewstatus on/off',
+    '┃  ▸ .statusreact on/off',
+    '┃  ▸ .welcome on/off',
+    '┃  ▸ .goodbye on/off',
+    '┃  ▸ .autoreact on/off',
+    '┃  ▸ .setemojis ❤️,🔥,😍',
+    '┃',
+    '┣━━━〔 👑 OWNER COMMANDS 〕━━━',
+    '┃',
+    '┃  ▸ .ban <phone number>',
+    '┃  ▸ .bans',
+    '┃  ▸ .unban <phone number>',
+    '┃',
+    '┣━━━━━━━━━━━━━━━━━━━━',
+    '┃  🔐 Owner commands are restricted',
+    '┃  📌 Unban removes a bot-access ban',
+    '┃',
+    '╰━━━━━━━━━━━━━━━━━━━━╯',
+    '       🔴 POWERED BY SCANTY'
   ].join('\n');
 }
+
 
 async function generateGeminiReply(userText) {
   const apiKey = process.env.GEMINI_API_KEY;
