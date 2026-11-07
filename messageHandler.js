@@ -411,12 +411,12 @@ export async function handleIncomingMessage(
 
   const prefix = settings.prefix || DEFAULT_PREFIX;
 
-  const reply = response =>
-    sock.sendMessage(
-      chatId,
-      { text: response },
-      { quoted: message }
-    );
+  const reply = (response, type = 'info') =>
+  sock.sendMessage(
+    chatId,
+    { text: styleMessage(response, type) },
+    { quoted: message }
+  );
 
   // Commands are processed before ordinary AI messages.
   if (!text.startsWith(prefix)) {
