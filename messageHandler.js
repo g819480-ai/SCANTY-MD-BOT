@@ -526,11 +526,22 @@ export async function handleIncomingMessage(
         );
       }
 
-      case 'ping':
-        return reply(
-          '🏓 SCANTY MD BOT is responding.'
-        );
+      case 'ping': {
+  const timestamp = Number(message.messageTimestamp);
 
+  const speed = Number.isFinite(timestamp) && timestamp > 0
+    ? Math.max(0, Date.now() - (timestamp * 1000))
+    : 0;
+
+  return reply(
+    '🏓 PONG!\n\n' +
+    `⚡ Response Speed: ${speed} ms\n` +
+    '🟢 System Status: ACTIVE\n' +
+    '🤖 Bot: SCANTY MD BOT\n' +
+    '🚀 Connection: ONLINE',
+    'success'
+  );
+}
       case 'uptime':
         return reply(
           `⏱️ Bot uptime: ${formatUptime(process.uptime())}`
