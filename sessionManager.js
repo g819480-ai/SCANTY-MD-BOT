@@ -846,32 +846,6 @@ export function getUserQrState(userId) {
 
 /* QR CODE LOGIN */
 
-      const savedCreds = await readRecord(
-        userId,
-        'creds',
-        'main'
-      );
-
-      if (savedCreds?.registered) {
-        throw new Error(
-          'This WhatsApp account is already linked.'
-        );
-      }
-
-      if (
-        sessions.has(userId) &&
-        !cancelPendingQrAttempt(userId)
-      ) {
-        throw new Error(
-          'A WhatsApp session is already active for this user.'
-        );
-      }
-
-      qrStates.delete(userId);
-
-      const state = makeAuthState(userId, savedCreds);
-
-
 export async function startUserQrSession(userId) {
   return withPairingLock(
     pairingLocks,
@@ -881,27 +855,30 @@ export async function startUserQrSession(userId) {
         throw new Error('Invalid user ID.');
       }
    const savedCreds = await readRecord(
-        userId,
-        'creds',
-        'main'
-      );
+  userId,
+  'creds',
+  'main'
+);
 
-      if (savedCreds?.registered) {
-        throw new Error(
-          'This WhatsApp account is already linked.'
-        );
-      }
+if (savedCreds?.registered) {
+  throw new Error(
+    'This WhatsApp account is already linked.'
+  );
+}
 
-      if (
-        sessions.has(userId) &&
-        !cancelPendingQrAttempt(userId)
-      ) {
-        throw new Error(
-          'A WhatsApp session is already active for this user.'
-        );
-      }
+if (
+  sessions.has(userId) &&
+  !cancelPendingQrAttempt(userId)
+) {
+  throw new Error(
+    'A WhatsApp session is already active for this user.'
+  );
+}
 
-      qrStates.delete(userId);
+qrStates.delete(userId);
+
+const state = makeAuthState(userId, savedCreds);
+        
 
 
 
