@@ -535,25 +535,19 @@ async function attachSocket(
 
   /* Save credentials whenever Baileys updates them. */
   sock.ev.on('creds.update', async () => {
-    try {
-      await saveRecord(
-        userId,
-        'creds',
-        'main',
-        state.creds
-      );
-
-      console.log('WHATSAPP CREDS SAVED:', {
-        registered: state.creds.registered === true,
-        hasMe: Boolean(state.creds.me)
-      });
-    } catch (error) {
-      console.error(
-        'Could not save WhatsApp credentials:',
-        error.message
-      );
-    }
-  });
+  try {
+    await saveCredentialsSafely(
+      userId,
+      state,
+      'creds.update'
+    );
+  } catch (error) {
+    console.error(
+      'SCANTY CREDENTIAL SAVE FAILED:',
+      error.message
+    );
+  }
+});
 
   /* Incoming messages and status updates. */
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
@@ -638,8 +632,32 @@ async function attachSocket(
     }
 
     if (connection === 'open') {
-      controller.connected();
-      sessionStatus.set(userId, 'connected');
+  controller.connected();
+  sessionStatus.set(userId, 'connected');
+
+  try {
+    await saveCredentialsSafely(
+      userId,
+      state,
+      'connection.open'
+    );
+  } catch (error) {
+    console.error(
+      'SCANTY FINAL SESSION SAVE FAILED:',
+      error.message
+    );
+  }
+
+  if (
+    state.creds.registered !== true ||
+    !state.creds.me
+  ) {
+    console.error('SCANTY SESSION WARNING:', {
+      userId,
+      registered: state.creds.registered === true,
+      hasMe: Boolean(state.creds.me)
+    });
+  }
 
       if (captureQr) {
         qrStates.set(userId, {
