@@ -221,10 +221,10 @@ async function initializeDatabase() {
     { unique: true }
   );
 
-  await db.collection('bot_bans').createIndex(
-    { user_id: 1, phone_number: 1 },
-    { unique: true }
-  );
+  await db.collection('bot_bans').createIndex({
+  user_id: 1,
+  phone_number: 1
+});
 
   const passwordHash = await bcrypt.hash(
     ADMIN_PASSWORD,
