@@ -683,6 +683,9 @@ async function attachSocket(
 
 /* INITIALIZE MONGODB SESSION STORAGE */
 
+
+/* INITIALIZE MONGODB SESSION STORAGE */
+
 export async function initializeSessionStorage() {
   const db = await getMongoDb();
 
@@ -692,14 +695,11 @@ export async function initializeSessionStorage() {
     record_id: 1
   });
 
-      unique: true
-    }
-  );
-
   console.log(
     'MongoDB WhatsApp session storage initialized.'
   );
 }
+
 
 /* RESTORE REGISTERED WHATSAPP SESSIONS */
 
