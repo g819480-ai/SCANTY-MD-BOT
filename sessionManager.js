@@ -880,14 +880,7 @@ export async function startUserQrSession(userId) {
       if (!/^[a-f0-9-]{16,64}$/i.test(userId)) {
         throw new Error('Invalid user ID.');
       }
-
-      if (sessions.has(userId)) {
-        throw new Error(
-          'A WhatsApp session is already active for this user.'
-        );
-      }
-
-      const savedCreds = await readRecord(
+   const savedCreds = await readRecord(
         userId,
         'creds',
         'main'
@@ -899,20 +892,18 @@ export async function startUserQrSession(userId) {
         );
       }
 
-      const state = makeAuthState(userId, savedCreds);
+      if (
+        sessions.has(userId) &&
+        !cancelPendingQrAttempt(userId)
+      ) {
+        throw new Error(
+          'A WhatsApp session is already active for this user.'
+        );
+      }
 
-      qrStates.set(userId, {
-        qr: null,
-        status: 'connecting',
-        updatedAt: Date.now()
-      });
+      qrStates.delete(userId);
 
-      await attachSocket(userId, state, true);
 
-      return { started: true };
-    }
-  );
-}
 
 /* CANCEL AN UNFINISHED QR ATTEMPT WHEN SWITCHING TO PHONE PAIRING */
 function cancelPendingQrAttempt(userId) {
