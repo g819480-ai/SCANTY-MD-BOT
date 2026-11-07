@@ -3,12 +3,12 @@
   "version": "1.0.0",
   "description": "SCANTY MD BOT Backend with MongoDB Session Manager",
   "type": "module",
-  "main": "server.js",
+  "main": "index.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.5",
+    "@whiskeysockets/baileys": "^6.7.24",
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "mongodb": "^6.8.0",
