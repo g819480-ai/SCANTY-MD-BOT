@@ -846,6 +846,32 @@ export function getUserQrState(userId) {
 
 /* QR CODE LOGIN */
 
+      const savedCreds = await readRecord(
+        userId,
+        'creds',
+        'main'
+      );
+
+      if (savedCreds?.registered) {
+        throw new Error(
+          'This WhatsApp account is already linked.'
+        );
+      }
+
+      if (
+        sessions.has(userId) &&
+        !cancelPendingQrAttempt(userId)
+      ) {
+        throw new Error(
+          'A WhatsApp session is already active for this user.'
+        );
+      }
+
+      qrStates.delete(userId);
+
+      const state = makeAuthState(userId, savedCreds);
+
+
 export async function startUserQrSession(userId) {
   return withPairingLock(
     pairingLocks,
@@ -887,6 +913,51 @@ export async function startUserQrSession(userId) {
     }
   );
 }
+
+/* CANCEL AN UNFINISHED QR ATTEMPT WHEN SWITCHING TO PHONE PAIRING */
+function cancelPendingQrAttempt(userId) {
+  const qrState = qrStates.get(userId);
+  const sock = sessions.get(userId);
+
+  if (
+    !sock ||
+    !qrState ||
+    !['connecting', 'qr'].includes(qrState.status)
+  ) {
+    return false;
+  }
+
+  stopPresenceHeartbeat(userId);
+
+  const controller = reconnectControllers.get(userId);
+  controller?.stop();
+
+  reconnectControllers.delete(userId);
+  reconnectContexts.delete(userId);
+
+  if (sessions.get(userId) === sock) {
+    sessions.delete(userId);
+  }
+
+  sessionStatus.set(userId, 'disconnected');
+
+  qrStates.set(userId, {
+    qr: null,
+    status: 'switching',
+    updatedAt: Date.now()
+  });
+
+  try {
+    sock.end(
+      new Error(
+        'QR pairing cancelled because phone pairing was selected.'
+      )
+    );
+  } catch {}
+
+  return true;
+}
+
 
 /* PHONE NUMBER PAIRING CODE LOGIN */
 
