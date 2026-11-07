@@ -1,8 +1,0 @@
-private_sessions/
-node_modules/
-session/
-auth_info/
-.env
-.env.*
-!.env.example
-*.log
