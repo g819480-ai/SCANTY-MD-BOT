@@ -1,18 +1,27 @@
+
 {
   "name": "scanty-md-bot",
-  "version": "1.0.0",
-  "description": "SCANTY MD BOT Backend with MongoDB Session Manager",
+  "version": "2.0.0",
+  "private": true,
   "type": "module",
+  "description": "SCANTY MD BOT - Multi-user WhatsApp automation platform",
   "main": "index.js",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "node --watch index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.24",
+    "@whiskeysockets/baileys": "6.7.24",
+    "bcryptjs": "^3.0.2",
     "cors": "^2.8.5",
-    "express": "^4.19.2",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
     "mongodb": "^6.8.0",
     "pino": "^9.0.0",
-    "qrcode": "^1.5.3"
+    "qrcode": "^1.5.4"
   }
 }
