@@ -686,13 +686,12 @@ async function attachSocket(
 export async function initializeSessionStorage() {
   const db = await getMongoDb();
 
-  await db.collection('whatsapp_sessions').createIndex(
-    {
-      user_id: 1,
-      record_type: 1,
-      record_id: 1
-    },
-    {
+  await db.collection('whatsapp_sessions').createIndex({
+    user_id: 1,
+    record_type: 1,
+    record_id: 1
+  });
+
       unique: true
     }
   );
