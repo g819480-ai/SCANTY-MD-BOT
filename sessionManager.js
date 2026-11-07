@@ -31,6 +31,7 @@ const qrStates = new Map();
 const reconnectControllers = new Map();
 const pairingLocks = new Set();
 const reconnectContexts = new Map();
+const credentialSaveQueues = new Map();
 
 const secret = process.env.SESSION_ENCRYPTION_KEY?.trim();
 
@@ -144,6 +145,43 @@ async function saveRecord(userId, type, id, value) {
   );
 }
 
+async function saveCredentialsSafely(userId, state, reason) {
+  const previous =
+    credentialSaveQueues.get(userId) || Promise.resolve();
+
+  const current = previous.catch(() => {}).then(async () => {
+    const snapshot = JSON.parse(
+      JSON.stringify(state.creds, BufferJSON.replacer),
+      BufferJSON.reviver
+    );
+
+    await saveRecord(
+      userId,
+      'creds',
+      'main',
+      snapshot
+    );
+
+    console.log('SCANTY SESSION CREDENTIALS SAVED:', {
+      userId,
+      reason,
+      registered: snapshot.registered === true,
+      hasMe: Boolean(snapshot.me)
+    });
+
+    return snapshot;
+  });
+
+  credentialSaveQueues.set(userId, current);
+
+  try {
+    return await current;
+  } finally {
+    if (credentialSaveQueues.get(userId) === current) {
+      credentialSaveQueues.delete(userId);
+    }
+  }
+}
 async function readRecord(userId, type, id) {
   const db = await getMongoDb();
 
